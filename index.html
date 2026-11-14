@@ -6,8 +6,8 @@
 <title>Ledger — Bank Statement Extractor v2</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" onerror="window.__pdfJsLoadFailed=true;"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" onerror="window.__xlsxLoadFailed=true;"></script>
 <style>
   :root{
     --paper:#F7F4EC;
@@ -360,7 +360,16 @@
 </div>
 
 <script>
-pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+// GUARD (bug fix): see extractPdfRows() for where this is actually invoked, and
+// the comment above the <script src> tags above for what this guards against.
+function ensurePdfJsReady(){
+  if (typeof pdfjsLib === 'undefined') {
+    throw new Error('PDF support library (pdf.js) failed to load from the CDN — check your internet connection or any content blocker, or upload this statement as CSV/Excel/TXT instead.');
+  }
+  if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  }
+}
 
 let rows = []; // {sno, date, narration, debit, credit, balance, type, typeConfidence, classificationFlags, dynamicFlags}
 
@@ -405,6 +414,18 @@ dropzone.addEventListener('drop', e => {
   if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
 });
 fileInput.addEventListener('change', e => { if (e.target.files.length) handleFile(e.target.files[0]); });
+
+// Surface a CDN load failure right away, as a clear message rather than a silent
+// dead button. Runs after the listeners above are already attached, so upload
+// for CSV/Excel/TXT keeps working even when this fires for a PDF-only failure.
+(function reportCdnLoadFailures(){
+  const failed = [];
+  if (window.__pdfJsLoadFailed) failed.push('PDF');
+  if (window.__xlsxLoadFailed) failed.push('Excel');
+  if (failed.length) {
+    showAlert(`${failed.join(' and ')} support could not load from the CDN in this environment (often caused by a content blocker, proxy, or a restrictive hosting/preview sandbox). Other upload formats will still work; reloading the page or opening it from a different host may fix this.`);
+  }
+})();
 clearFileBtn.addEventListener('click', () => {
   fileInput.value = '';
   filebar.style.display = 'none';
@@ -912,6 +933,7 @@ function pdfExtractRow(anchor, rowItems, layout){
 }
 
 async function extractPdfRows(file, onProgress){
+  ensurePdfJsReady();
   const buf = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
   const allRows = [];
