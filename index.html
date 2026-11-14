@@ -1,0 +1,2280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ledger — Bank Statement Extractor v2</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  :root{
+    --paper:#F7F4EC;
+    --paper-raised:#FBF9F3;
+    --ink:#1E2A22;
+    --ink-soft:#5B665C;
+    --rule:#D9D2BE;
+    --rule-soft:#E7E1D2;
+    --forest:#1F4B3C;
+    --forest-light:#2F6B52;
+    --forest-wash:rgba(31,75,60,0.05);
+    --debit:#A6432B;
+    --debit-wash:rgba(166,67,43,0.08);
+    --credit:#2C5F5C;
+    --credit-wash:rgba(44,95,92,0.08);
+    --margin-rule:#C97361;
+    --shadow:0 1px 2px rgba(30,42,34,0.06),0 4px 14px rgba(30,42,34,0.05);
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:'Inter',sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:40px 28px 100px;}
+
+  /* Header */
+  .masthead{
+    display:flex;justify-content:space-between;align-items:flex-end;
+    border-bottom:2px solid var(--ink);
+    padding-bottom:18px;margin-bottom:6px;
+    flex-wrap:wrap;gap:16px;
+  }
+  .masthead h1{
+    font-family:'Fraunces',serif;font-weight:600;font-size:34px;
+    margin:0;letter-spacing:-0.01em;color:var(--forest);
+  }
+  .masthead .sub{
+    font-size:13px;color:var(--ink-soft);margin-top:4px;
+    font-family:'IBM Plex Mono',monospace;letter-spacing:0.02em;
+  }
+  .masthead .tag{
+    font-size:12px;color:var(--ink-soft);text-align:right;
+    font-family:'IBM Plex Mono',monospace;line-height:1.6;
+  }
+
+  /* Step rail */
+  .rail{display:flex;gap:0;margin:28px 0 32px;border-bottom:1px solid var(--rule);}
+  .rail-step{
+    flex:1;padding:14px 4px 12px;text-align:left;position:relative;
+    font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);
+    border-bottom:2px solid transparent;margin-bottom:-1px;
+  }
+  .rail-step .num{font-size:11px;opacity:0.6;}
+  .rail-step .label{display:block;font-size:14px;font-family:'Inter',sans-serif;font-weight:600;color:var(--ink);margin-top:2px;}
+  .rail-step.active{border-bottom-color:var(--forest);}
+  .rail-step.active .label{color:var(--forest);}
+  .rail-step.done .label:after{content:" ✓";color:var(--forest-light);}
+
+  section{margin-bottom:36px;}
+  .card{
+    background:var(--paper-raised);border:1px solid var(--rule-soft);
+    border-radius:6px;box-shadow:var(--shadow);padding:26px 28px;
+  }
+  h2{
+    font-family:'Fraunces',serif;font-size:19px;font-weight:600;margin:0 0 4px;color:var(--ink);
+  }
+  .hint{font-size:13px;color:var(--ink-soft);margin:0 0 18px;line-height:1.55;}
+
+  /* Dropzone */
+  .dropzone{
+    border:1.5px dashed var(--rule);border-radius:6px;padding:44px 20px;
+    text-align:center;cursor:pointer;transition:border-color .15s, background .15s;
+    background:var(--forest-wash);
+  }
+  .dropzone:hover, .dropzone.drag{border-color:var(--forest-light);background:rgba(31,75,60,0.08);}
+  .dropzone .icon{font-size:28px;margin-bottom:10px;color:var(--forest);}
+  .dropzone .main{font-weight:600;font-size:15px;}
+  .dropzone .sub{font-size:12.5px;color:var(--ink-soft);margin-top:6px;font-family:'IBM Plex Mono',monospace;}
+  input[type=file]{display:none;}
+
+  .filebar{
+    display:flex;align-items:center;justify-content:space-between;
+    background:var(--forest-wash);border:1px solid var(--rule-soft);
+    border-radius:6px;padding:12px 16px;font-size:13.5px;margin-top:14px;
+  }
+  .filebar .name{font-family:'IBM Plex Mono',monospace;font-weight:500;}
+  .filebar button{background:none;border:none;color:var(--debit);cursor:pointer;font-size:12.5px;font-family:'Inter',sans-serif;font-weight:600;}
+
+  .progress-line{
+    height:3px;background:var(--rule-soft);border-radius:2px;overflow:hidden;margin-top:16px;
+    display:none;
+  }
+  .progress-line.on{display:block;}
+  .progress-line .bar{height:100%;width:0%;background:var(--forest-light);transition:width .2s;}
+  .status-text{font-size:12.5px;color:var(--ink-soft);margin-top:8px;font-family:'IBM Plex Mono',monospace;display:none;}
+  .status-text.on{display:block;}
+
+  .alert{
+    border-left:3px solid var(--debit);background:var(--debit-wash);
+    padding:12px 16px;font-size:13px;border-radius:0 4px 4px 0;margin-top:16px;color:var(--ink);
+    display:none;
+  }
+  .alert.on{display:block;}
+
+  /* Summary strip */
+  .summary{display:flex;gap:0;flex-wrap:wrap;margin-bottom:0;}
+  .stat{flex:1;min-width:130px;padding:16px 20px;border-right:1px solid var(--rule-soft);}
+  .stat:last-child{border-right:none;}
+  .stat .label{font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-soft);font-family:'IBM Plex Mono',monospace;}
+  .stat .value{font-family:'IBM Plex Mono',monospace;font-size:19px;font-weight:600;margin-top:4px;}
+  .stat.debit .value{color:var(--debit);}
+  .stat.credit .value{color:var(--credit);}
+
+  /* Table */
+  .table-scroll{overflow-x:auto;border:1px solid var(--rule-soft);border-radius:6px;margin-top:18px;position:relative;}
+  table{width:100%;border-collapse:collapse;font-size:13px;min-width:820px;}
+  thead th{
+    background:var(--forest);color:#F2EFE4;text-align:left;
+    padding:10px 14px;font-family:'IBM Plex Mono',monospace;font-weight:500;
+    font-size:11.5px;letter-spacing:0.04em;text-transform:uppercase;
+    position:sticky;top:0;z-index:2;
+  }
+  thead th:first-child{position:relative;}
+  tbody td{
+    padding:9px 14px;border-bottom:1px solid var(--rule-soft);vertical-align:top;
+    font-family:'IBM Plex Mono',monospace;font-size:12.5px;
+  }
+  tbody tr:nth-child(odd){background:rgba(31,75,60,0.025);}
+  tbody tr:hover{background:var(--forest-wash);}
+  td.narration{font-family:'Inter',sans-serif;font-size:13px;min-width:260px;}
+  td[contenteditable="true"]{outline:none;cursor:text;}
+  td[contenteditable="true"]:focus{background:#fff;box-shadow:inset 0 0 0 1.5px var(--forest-light);}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;}
+  td.debit-cell{color:var(--debit);}
+  td.credit-cell{color:var(--credit);}
+  .est-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#C99A3F;margin-right:6px;vertical-align:middle;}
+  .dup-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#6C63FF;margin-right:6px;vertical-align:middle;}
+  .info-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#3B7DD6;margin-right:6px;vertical-align:middle;}
+  .issue-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#D64545;margin-right:6px;vertical-align:middle;}
+  .row-actions{white-space:nowrap;}
+  .row-actions button{
+    border:none;background:none;cursor:pointer;font-size:11px;
+    font-family:'Inter',sans-serif;font-weight:600;padding:2px 6px;border-radius:3px;
+  }
+  .swap-btn{color:var(--forest);}
+  .swap-btn:hover{background:var(--forest-wash);}
+  .del-btn{color:var(--debit);}
+  .del-btn:hover{background:var(--debit-wash);}
+
+  .table-tools{display:flex;justify-content:space-between;align-items:center;margin-top:14px;flex-wrap:wrap;gap:10px;}
+  .legend{font-size:12px;color:var(--ink-soft);display:flex;align-items:center;gap:6px;}
+
+  button.ghost{
+    background:none;border:1px solid var(--rule);color:var(--ink);
+    padding:8px 14px;border-radius:5px;font-family:'Inter',sans-serif;font-size:12.5px;font-weight:600;
+    cursor:pointer;transition:border-color .15s;
+  }
+  button.ghost:hover{border-color:var(--forest);color:var(--forest);}
+
+  /* Export */
+  .export-grid{display:grid;grid-template-columns:1fr 1fr;gap:28px;}
+  @media (max-width:760px){.export-grid{grid-template-columns:1fr;}}
+  .field{margin-bottom:14px;}
+  .field label{display:block;font-size:12px;font-weight:600;margin-bottom:5px;color:var(--ink-soft);text-transform:uppercase;letter-spacing:0.04em;}
+  .field input{
+    width:100%;padding:9px 11px;border:1px solid var(--rule);border-radius:5px;
+    font-family:'IBM Plex Mono',monospace;font-size:13px;background:#fff;color:var(--ink);
+  }
+  .field input:focus{outline:none;border-color:var(--forest-light);}
+  .export-btn{
+    width:100%;padding:13px 16px;border-radius:6px;border:none;cursor:pointer;
+    font-family:'Inter',sans-serif;font-weight:700;font-size:14px;letter-spacing:0.01em;
+    display:flex;align-items:center;justify-content:center;gap:8px;margin-top:6px;
+    transition:transform .1s, box-shadow .15s;
+  }
+  .export-btn:hover{transform:translateY(-1px);box-shadow:var(--shadow);}
+  .export-btn:disabled{opacity:0.45;cursor:not-allowed;transform:none;box-shadow:none;}
+  .btn-xlsx{background:var(--forest);color:#F2EFE4;}
+  .btn-tally{background:var(--paper-raised);color:var(--forest);border:1.5px solid var(--forest);}
+
+
+  /* Creator */
+  .creator-card{
+    margin:18px 0 22px;padding:14px 18px;border:1px solid var(--rule);
+    border-left:4px solid var(--forest);background:var(--paper-raised);
+    border-radius:6px;display:flex;align-items:center;justify-content:space-between;
+    gap:18px;flex-wrap:wrap;box-shadow:var(--shadow);
+  }
+  .creator-title{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-soft);font-weight:700;margin-bottom:3px;}
+  .creator-name{font-size:15px;font-weight:800;color:var(--forest);}
+  .creator-contact{display:flex;gap:18px;flex-wrap:wrap;font-size:12.5px;}
+  .creator-contact a{color:var(--ink);text-decoration:none;font-weight:600;}
+  .creator-contact a:hover{color:var(--forest);text-decoration:underline;}
+
+  footer{margin-top:50px;padding-top:18px;border-top:1px solid var(--rule);font-size:12px;color:var(--ink-soft);line-height:1.7;}
+
+  ::selection{background:rgba(31,75,60,0.18);}
+</style>
+
+<style id="creator-rights-style">
+.creator-rights-notice{margin:18px 0 8px;padding:12px 16px;border:1px solid #bbb;border-radius:8px;text-align:center;font-size:12px;line-height:1.5;background:#f7f7f7;color:#222}.creator-rights-notice strong{font-size:13px}.creator-rights-notice a{color:inherit;text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="masthead">
+    <div>
+      <h1>Ledger</h1>
+      <div class="sub">bank statement → structured ledger, in the browser · v4 (adaptive layout detection)</div>
+    </div>
+    <div class="tag">no data leaves this tab<br>parsing runs entirely client-side</div>
+  </div>
+
+  <div class="creator-card" aria-label="About the creator">
+    <div>
+      <div class="creator-title">About the Creator</div>
+      <div class="creator-name">Created by Ismail Ahmad</div>
+    </div>
+    <div class="creator-contact">
+      <a href="mailto:ismailahmad94282@gmail.com">✉ ismailahmad94282@gmail.com</a>
+      <a href="tel:+919310794282">☎ +91 9310794282</a>
+    </div>
+  </div>
+
+  <div class="rail">
+    <div class="rail-step active" id="rail-1"><span class="num">01</span><span class="label">Upload statement</span></div>
+    <div class="rail-step" id="rail-2"><span class="num">02</span><span class="label">Review &amp; correct</span></div>
+    <div class="rail-step" id="rail-3"><span class="num">03</span><span class="label">Export</span></div>
+  </div>
+
+  <!-- STEP 1: UPLOAD -->
+  <section id="section-upload">
+    <div class="card">
+      <h2>Upload a bank statement</h2>
+      <p class="hint">Works with PDF, Excel (.xlsx/.xls), CSV, and plain-text exports of your statement. Text-based statement PDFs (most net-banking downloads) work best for that format; scanned image PDFs can't be read this way — try exporting a CSV or Excel copy instead if your bank offers one.</p>
+
+      <div class="dropzone" id="dropzone">
+        <div class="icon">&#128196;</div>
+        <div class="main">Drop a statement here, or click to browse</div>
+        <div class="sub">.PDF · .XLSX · .XLS · .CSV · .TXT · processed locally · nothing uploaded to a server</div>
+        <input type="file" id="fileInput" accept=".pdf,.xlsx,.xls,.csv,.txt,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv,text/plain">
+      </div>
+
+      <div class="filebar" id="filebar" style="display:none;">
+        <span class="name" id="filename"></span>
+        <button id="clearFile">remove</button>
+      </div>
+
+      <div class="progress-line" id="progressLine"><div class="bar" id="progressBar"></div></div>
+      <div class="status-text" id="statusText"></div>
+      <div class="hint" id="layoutText" style="display:none;margin-top:8px;"></div>
+      <div class="alert" id="alertBox"></div>
+    </div>
+
+    <div class="card" id="fallbackCard" style="display:none;margin-top:18px;">
+      <h2>Try a different format</h2>
+      <p class="hint" id="fallbackHint">This extraction came out low-quality. If you have the same statement in another format — Excel, CSV, or a plain-text export — upload it here. Ledger will parse it separately and let you pick whichever result is cleaner.</p>
+
+      <div class="dropzone" id="fallbackDropzone" style="padding:26px 20px;">
+        <div class="icon">&#128260;</div>
+        <div class="main">Drop a fallback file here, or click to browse</div>
+        <div class="sub">.PDF · .XLSX · .XLS · .CSV · .TXT · compared against the result above</div>
+        <input type="file" id="fallbackFileInput" accept=".pdf,.xlsx,.xls,.csv,.txt,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv,text/plain">
+      </div>
+
+      <div class="status-text" id="fallbackStatusText"></div>
+      <div class="alert" id="fallbackAlertBox"></div>
+
+      <div id="fallbackChoice" style="display:none;margin-top:16px;">
+        <p class="hint" id="fallbackChoiceText" style="margin-bottom:12px;"></p>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;">
+          <button class="ghost" id="useFallbackBtn"></button>
+          <button class="ghost" id="keepPrimaryBtn"></button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- STEP 2: REVIEW -->
+  <section id="section-review" style="display:none;">
+    <div class="card">
+      <h2>Review the extracted rows</h2>
+      <p class="hint">Every cell is editable — click to correct. Ledger detects the statement's columns automatically. When Debit/Credit or Amount + Dr/Cr columns are detected, the amount is taken only from that physical column. The running balance is then used as a cross-check. If a statement has only one Amount column, the balance/Dr-Cr marker helps determine direction. Rows with an amber dot need review; nothing is auto-removed as a duplicate.</p>
+
+      <div class="summary card" style="padding:0;margin-bottom:0;box-shadow:none;">
+        <div class="stat"><div class="label">Transactions</div><div class="value" id="statCount">0</div></div>
+        <div class="stat debit"><div class="label">Total Debit</div><div class="value" id="statDebit">0.00</div></div>
+        <div class="stat credit"><div class="label">Total Credit</div><div class="value" id="statCredit">0.00</div></div>
+        <div class="stat"><div class="label">Closing Balance</div><div class="value" id="statBalance">—</div></div>
+      </div>
+
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:56px;">S.No</th>
+              <th style="width:100px;">Date</th>
+              <th>Narration</th>
+              <th style="width:110px;" class="num">Debit</th>
+              <th style="width:110px;" class="num">Credit</th>
+              <th style="width:110px;" class="num">Balance</th>
+              <th style="width:70px;">&nbsp;</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+
+      <div class="table-tools">
+        <div class="legend"><span class="est-dot"></span> balance-delta couldn't cleanly classify this row (opening anchor, broken balance chain, or zero change) — see Processing Summary</div>
+        <div class="legend"><span class="dup-dot"></span> possible duplicate — same date, amount &amp; direction as another row, narration similar; never auto-removed — review manually</div>
+        <div class="legend"><span class="info-dot"></span> possible reversal pair — same date &amp; amount, opposite direction; informational, not an error</div>
+        <div class="legend"><span class="issue-dot"></span> failed structural validation — missing date, missing balance, or empty narration; hover for details</div>
+        <button class="ghost" id="addRow">+ add row</button>
+      </div>
+    </div>
+
+    <div class="card" id="reportPanel" style="margin-top:18px;"></div>
+  </section>
+
+  <!-- STEP 3: EXPORT -->
+  <section id="section-export" style="display:none;">
+    <div class="card">
+      <h2>Export</h2>
+      <p class="hint">Excel export is a straight, clean copy of the table above. The Tally export needs your ledger names mapped first, since Tally vouchers post against real ledgers in your Chart of Accounts. The extracted table itself is kept independent of the source bank layout.</p>
+
+      <div class="export-grid">
+        <div>
+          <div class="field"><label>Bank ledger name (in Tally)</label><input id="bankLedger" value="Bank Account"></div>
+          <div class="field"><label>Suspense / contra ledger name</label><input id="suspenseLedger" value="Suspense Account"></div>
+          <div class="field"><label>Company name (STATIC VARIABLE, optional)</label><input id="companyName" placeholder="Leave blank to use Tally's active company"></div>
+        </div>
+        <div>
+          <button type="button" class="export-btn btn-xlsx" id="exportXlsx">&#8615; Download Excel (.xlsx)</button>
+          <button type="button" class="export-btn btn-tally" id="exportTally">&#8615; Download Tally XML (.xml)</button>
+          <p class="hint" style="margin-top:14px;">Tally XML posts one Payment voucher per debit row and one Receipt voucher per credit row, each pairing your bank ledger against the suspense ledger above. Re-allocate the suspense entries to real expense/income ledgers inside Tally, or edit the ledger name per row before export by adjusting Narration-based rules later.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    The extractor detects PDF columns from the statement header and page geometry. Debit/Credit or Amount + Dr/Cr values are read only from their detected amount columns; narration numbers, UTRs, cheque numbers, and other text are not treated as transaction amounts. Running balance is used as a validation check and as a fallback when direction is genuinely ambiguous. Always verify totals against the statement's opening/closing balance before relying on the export.
+  </footer>
+
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+let rows = []; // {sno, date, narration, debit, credit, balance, type, typeConfidence, classificationFlags, dynamicFlags}
+
+// Multi-format ingestion: PDF is parsed via text-position reconstruction (below);
+// XLSX/XLS and CSV are parsed as tables with header-column detection, falling back
+// to the same line-based parser PDF uses when no recognisable header row is found;
+// TXT is fed straight into the line-based parser, since a plain-text export is
+// already the same shape PDF.js text extraction produces.
+const SUPPORTED_EXTS = ['pdf','xlsx','xls','csv','txt'];
+const LOW_QUALITY_THRESHOLD = 0.65; // below this, offer a fallback-format prompt
+
+let primaryResult = null;  // {rows, quality, issueCount, sourceLabel, fileName}
+let fallbackResult = null; // same shape, from the fallback-format upload
+
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const filebar = document.getElementById('filebar');
+const filenameEl = document.getElementById('filename');
+const clearFileBtn = document.getElementById('clearFile');
+const progressLine = document.getElementById('progressLine');
+const progressBar = document.getElementById('progressBar');
+const statusText = document.getElementById('statusText');
+const layoutText = document.getElementById('layoutText');
+const alertBox = document.getElementById('alertBox');
+
+const fallbackCard = document.getElementById('fallbackCard');
+const fallbackHint = document.getElementById('fallbackHint');
+const fallbackDropzone = document.getElementById('fallbackDropzone');
+const fallbackFileInput = document.getElementById('fallbackFileInput');
+const fallbackStatusText = document.getElementById('fallbackStatusText');
+const fallbackAlertBox = document.getElementById('fallbackAlertBox');
+const fallbackChoice = document.getElementById('fallbackChoice');
+const fallbackChoiceText = document.getElementById('fallbackChoiceText');
+const useFallbackBtn = document.getElementById('useFallbackBtn');
+const keepPrimaryBtn = document.getElementById('keepPrimaryBtn');
+
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault(); dropzone.classList.remove('drag');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => { if (e.target.files.length) handleFile(e.target.files[0]); });
+clearFileBtn.addEventListener('click', () => {
+  fileInput.value = '';
+  filebar.style.display = 'none';
+  dropzone.style.display = 'block';
+  rows = [];
+  primaryResult = null;
+  document.getElementById('section-review').style.display = 'none';
+  document.getElementById('section-export').style.display = 'none';
+  hideFallbackCard();
+  if (layoutText) { layoutText.textContent = ''; layoutText.style.display = 'none'; }
+  setRail(1);
+});
+
+function setRail(step){
+  for(let i=1;i<=3;i++){
+    const el = document.getElementById('rail-'+i);
+    el.classList.remove('active','done');
+    if(i<step) el.classList.add('done');
+    if(i===step) el.classList.add('active');
+  }
+}
+
+function showAlert(msg){
+  alertBox.textContent = msg;
+  alertBox.classList.add('on');
+}
+function hideAlert(){ alertBox.classList.remove('on'); }
+
+function getExt(name){
+  const m = /\.([a-z0-9]+)$/i.exec(name || '');
+  return m ? m[1].toLowerCase() : '';
+}
+
+// ---------- Common post-processing, shared by every source format ----------
+// Serial numbers are assigned once, here, and never recalculated from table
+// position afterward — they're the stable join key the audit report below
+// keys every finding against, so a row keeps its S.No even if later rows are
+// deleted around it.
+let snoCounter = 0;
+
+function processRawRows(rawRows){
+  snoCounter = 0;
+  rawRows.forEach(r => {
+    r.sno = ++snoCounter;
+    r.classificationFlags = [];  // set once here, by classifyByBalanceDelta
+    r.dynamicFlags = [];         // rebuilt on every render, by reprocessAnnotations
+  });
+
+  // Balance-delta is the ONLY thing that sets r.type / overwrites r.debit+r.credit,
+  // and it runs exactly once, at parse time. Duplicate detection and structural
+  // validation (reprocessAnnotations) are safe to re-run on every render because
+  // they only annotate — classification is not, because re-running it after the
+  // user manually edits a debit/credit cell would silently discard that edit.
+  classifyByBalanceDelta(rawRows);
+  const issueCount = reprocessAnnotations(rawRows);
+  return { rows: rawRows, issueCount };
+}
+
+// Re-derives everything that's safe to recompute from the CURRENT row state:
+// duplicate/reversal flags and structural validation. Never touches type,
+// typeConfidence, debit, or credit — those are only set by classifyByBalanceDelta
+// (at parse time) or by the user directly editing a cell.
+function reprocessAnnotations(rowsList){
+  rowsList.forEach(r => { r.dynamicFlags = []; });
+  detectDuplicates(rowsList);
+  return validateRows(rowsList);
+}
+
+function allFlags(row){
+  return (row.classificationFlags || []).concat(row.dynamicFlags || []);
+}
+
+// Rough extraction-quality signal: penalize rows the balance-delta pass couldn't
+// cleanly resolve more heavily when they also failed structural validation, then
+// normalise by row count so a short and a long statement are comparable. 0 rows
+// always scores 0.
+function qualityScore(rows, issueCount){
+  if (!rows.length) return 0;
+  const unresolvedCount = rows.filter(r => !['DERIVED','COLUMN','MANUAL'].includes(r.typeConfidence)).length;
+  const penalty = (issueCount + unresolvedCount * 0.5) / rows.length;
+  return Math.max(0, 1 - penalty);
+}
+
+// ---------- Format-specific extraction, all returning { rawRows, sourceLabel, detail } ----------
+async function extractRawRows(file, onProgress){
+  const ext = getExt(file.name);
+
+  if (ext === 'pdf') {
+    const { rawRows, numPages, layoutSummary } = await extractPdfRows(file, onProgress);
+    if (onProgress) onProgress('Validating detected transactions…', 90);
+    return { rawRows, sourceLabel: 'PDF', detail: `${numPages} page(s) · ${layoutSummary}`, layoutSummary };
+  }
+
+  if (ext === 'xlsx' || ext === 'xls') {
+    if (onProgress) onProgress('Reading workbook…', 30);
+    const { aoa, sheetName } = await extractWorkbookAoa(file);
+    if (onProgress) onProgress('Parsing transactions…', 70);
+    let rawRows = rowsFromTable(aoa);
+    let detail = `sheet "${sheetName}"`;
+    if (!rawRows) {
+      rawRows = parseLines(linesFromAoa(aoa));
+      detail += ', no header row recognised — used line-based parsing';
+    }
+    return { rawRows, sourceLabel: 'Excel', detail };
+  }
+
+  if (ext === 'csv') {
+    if (onProgress) onProgress('Reading CSV…', 30);
+    const aoa = parseCsvText(await file.text());
+    if (onProgress) onProgress('Parsing transactions…', 70);
+    let rawRows = rowsFromTable(aoa);
+    let detail = `${aoa.length} row(s) read`;
+    if (!rawRows) {
+      rawRows = parseLines(linesFromAoa(aoa));
+      detail += ', no header row recognised — used line-based parsing';
+    }
+    return { rawRows, sourceLabel: 'CSV', detail };
+  }
+
+  if (ext === 'txt') {
+    if (onProgress) onProgress('Reading text file…', 30);
+    const lines = (await file.text()).split(/\r?\n/);
+    if (onProgress) onProgress('Parsing transactions…', 70);
+    return { rawRows: parseLines(lines), sourceLabel: 'Text', detail: `${lines.length} line(s) read` };
+  }
+
+  throw new Error('unsupported file type');
+}
+
+// ---------- Adaptive PDF column detection ----------
+// PDF text is first read with coordinates. No bank-specific X coordinates are used.
+// The header is detected from its words, then column centres/boundaries are inferred
+// from the actual PDF geometry. Transaction rows are anchored by dates in the detected
+// Date column. Amounts are accepted only from detected Debit/Credit/Amount/Balance
+// columns, so numbers inside narration, UTRs, cheque numbers, etc. are ignored.
+const PDF_HEADER_PATTERNS = {
+  date: /\b(date|txn\s*date|transaction\s*date|posting\s*date|trans\s*date)\b/i,
+  narration: /\b(narration|description|particulars|details|remarks|transaction\s*details?|particular)\b/i,
+  valueDate: /\b(value\s*date|valued\s*date|value)\b/i,
+  debit: /\b(debit|withdrawal|withdrawals|dr\.?)\b/i,
+  credit: /\b(credit|deposit|deposits|cr\.?)\b/i,
+  balance: /\b(balance|closing\s*balance|running\s*balance|closing\s*bal\.?|available\s*balance)\b/i,
+  amount: /^\s*(amount|txn\s*amount|transaction\s*amount)\s*$/i,
+  type: /^\s*(type|dr\s*\/\s*cr|drcr|indicator|txn\s*type|transaction\s*type)\s*$/i
+};
+
+function pdfYLines(items, tolerance = 3){
+  const groups = [];
+  [...items].sort((a,b) => b.y - a.y || a.x - b.x).forEach(it => {
+    let g = groups.find(x => Math.abs(x.y - it.y) <= tolerance);
+    if (!g) {
+      g = { y: it.y, items: [] };
+      groups.push(g);
+    }
+    g.items.push(it);
+  });
+  groups.forEach(g => g.items.sort((a,b) => a.x - b.x));
+  groups.sort((a,b) => b.y - a.y);
+  return groups;
+}
+
+function pdfHeaderDetection(items){
+  const groups = pdfYLines(items, 3.5);
+  const candidates = [];
+  groups.forEach(g => {
+    const found = {};
+    g.items.forEach(it => {
+      const s = it.text.trim();
+      if (!s) return;
+      Object.keys(PDF_HEADER_PATTERNS).forEach(key => {
+        if (found[key] === undefined && PDF_HEADER_PATTERNS[key].test(s)) {
+          found[key] = { x: it.x, center: it.x + it.width/2, text: s, y: g.y };
+        }
+      });
+    });
+    const hasDate = found.date !== undefined;
+    const hasNarr = found.narration !== undefined;
+    const hasAmounts = found.debit !== undefined || found.credit !== undefined ||
+                       found.amount !== undefined || found.balance !== undefined;
+    if (hasDate && hasNarr && hasAmounts) {
+      candidates.push({ y: g.y, found });
+    }
+  });
+  if (!candidates.length) return null;
+
+  // Prefer the candidate with the largest number of useful column labels.
+  candidates.sort((a,b) =>
+    Object.keys(b.found).length - Object.keys(a.found).length ||
+    b.y - a.y
+  );
+  return candidates[0];
+}
+
+function pdfColumnBoundaries(columns, pageWidth){
+  const ordered = Object.entries(columns)
+    .filter(([,c]) => c && isFinite(c.center))
+    .map(([key,c]) => ({ key, center:c.center }))
+    .sort((a,b) => a.center - b.center);
+
+  const bounds = {};
+  ordered.forEach((c, i) => {
+    const left = i === 0 ? 0 : (ordered[i-1].center + c.center) / 2;
+    const right = i === ordered.length-1 ? pageWidth : (c.center + ordered[i+1].center) / 2;
+    bounds[c.key] = { left, right, center:c.center };
+  });
+  return bounds;
+}
+
+function pdfItemInBound(it, bound){
+  const cx = it.x + it.width/2;
+  return cx >= bound.left - 1 && cx < bound.right + 1;
+}
+
+// ---------- Bank-independent numeric token handling ----------
+// PDF text extraction is not guaranteed to return one visual amount as one text
+// object. A bank may return "1,50,000.00" as one object, as several objects, or
+// with the currency/sign separated from the digits. Never infer a decimal point
+// merely from the last two digits. A decimal exists only when the source text
+// contains a decimal separator.
+function pdfNormalizeNumericText(text){
+  if (text == null) return '';
+  let s = String(text)
+    .replace(/[\u00A0\u202F]/g, ' ')
+    .replace(/[₹$€£]/g, '')
+    .replace(/[−–—]/g, '-')
+    .trim();
+  if (!s) return '';
+
+  let negative = false;
+  if (/^\(.*\)$/.test(s)) { negative = true; s = s.slice(1, -1); }
+  if (/^[-]/.test(s)) { negative = true; s = s.replace(/^[-]+/, ''); }
+
+  // Remove spaces used as thousands separators, but preserve digits and the two
+  // possible decimal/thousands punctuation marks until their role is determined.
+  s = s.replace(/\s+/g, '');
+  if (!/[0-9]/.test(s)) return '';
+
+  const dots = (s.match(/\./g) || []).length;
+  const commas = (s.match(/,/g) || []).length;
+
+  if (dots && commas) {
+    // The final punctuation is the decimal separator; all earlier punctuation
+    // is grouping. This handles both 1,234,567.89 and 1.234.567,89.
+    const lastDot = s.lastIndexOf('.');
+    const lastComma = s.lastIndexOf(',');
+    const decimalPos = Math.max(lastDot, lastComma);
+    const decimalSep = s[decimalPos];
+    const whole = s.slice(0, decimalPos).replace(/[.,]/g, '');
+    const frac = s.slice(decimalPos + 1).replace(/[.,]/g, '');
+    if (!/^\d+$/.test(whole) || !/^\d+$/.test(frac)) return '';
+    return (negative ? '-' : '') + whole + '.' + frac;
+  }
+
+  if (dots || commas) {
+    const sep = dots ? '.' : ',';
+    const parts = s.split(sep);
+    if (parts.some(x => x !== '' && !/^\d+$/.test(x))) return '';
+
+    // One separator followed by exactly 1–2 digits is treated as a decimal.
+    // Three trailing digits are treated as thousands grouping. For repeated
+    // separators, Indian and Western grouping are both accepted.
+    if (parts.length === 2) {
+      const left = parts[0], right = parts[1];
+      if (/^\d+$/.test(left) && /^\d{1,2}$/.test(right)) {
+        return (negative ? '-' : '') + left + '.' + right;
+      }
+      if (/^\d+$/.test(left) && /^\d{3}$/.test(right)) {
+        return (negative ? '-' : '') + left + right;
+      }
+      // A single separator followed by 3+ digits is grouping, not an invented decimal.
+      if (/^\d+$/.test(left) && /^\d{3,}$/.test(right)) {
+        return (negative ? '-' : '') + left + right;
+      }
+      return '';
+    }
+
+    // Multiple separators: validate grouping and remove them. This intentionally
+    // accepts both 1,00,000 and 1,000,000, as well as their dot equivalents.
+    const validGrouping = /^\d{1,3}(?:[.,]\d{2,3})+$/;
+    if (!validGrouping.test(s)) return '';
+    return (negative ? '-' : '') + s.replace(/[.,]/g, '');
+  }
+
+  return /^\d+(?:\d+)?$/.test(s) ? (negative ? '-' : '') + s : '';
+}
+
+function pdfNumberValue(text){
+  const normalized = pdfNormalizeNumericText(text);
+  if (!normalized) return null;
+  const v = Number(normalized);
+  return isFinite(v) ? Math.abs(v) : null;
+}
+
+function pdfFormatAmount(value, sourceText){
+  if (value == null || !isFinite(value)) return '';
+  const raw = String(sourceText == null ? '' : sourceText);
+  // Preserve the source's decimal presence. Do not manufacture .00 for a bank
+  // that prints whole-number amounts. When decimals are present, retain up to
+  // the source precision, capped at 2 for normal bank statements.
+  const cleaned = pdfNormalizeNumericText(raw);
+  if (!cleaned) return '';
+  if (cleaned.includes('.')) {
+    const decimals = cleaned.split('.')[1].length;
+    return value.toFixed(Math.min(Math.max(decimals, 1), 2));
+  }
+  return String(Math.round(value));
+}
+
+// Group PDF text objects that are visually adjacent into complete numeric tokens.
+// This is critical for PDFs where "1,50,000.00" is emitted as several objects.
+function pdfNumericTokens(items){
+  if (!items.length) return [];
+  const groups = pdfYLines(items, 2.8);
+  const tokens = [];
+  groups.forEach(g => {
+    const sorted = [...g.items].sort((a,b)=>a.x-b.x);
+    let run = [];
+    const flush = () => {
+      if (!run.length) return;
+      const text = run.map(it => it.text).join('');
+      const normalized = pdfNormalizeNumericText(text);
+      if (normalized) {
+        const left = Math.min(...run.map(it => it.x));
+        const right = Math.max(...run.map(it => it.x + it.width));
+        const v = Number(normalized);
+        if (isFinite(v)) tokens.push({ text, value: Math.abs(v), x:left, right, y:g.y, items:[...run] });
+      }
+      run = [];
+    };
+    sorted.forEach(it => {
+      const t = it.text.trim();
+      const numericLike = /[0-9]/.test(t) && /^[0-9,.;:₹$€£()\s+\-]+$/.test(t);
+      if (!numericLike) { flush(); return; }
+      const prev = run[run.length-1];
+      const gap = prev ? it.x - (prev.x + prev.width) : 0;
+      // Amount components can be separated by tiny PDF-object gaps. Keep ordinary
+      // word-like gaps out of a numeric token.
+      if (prev && gap > 8) flush();
+      run.push(it);
+    });
+    flush();
+  });
+  return tokens;
+}
+
+function pdfJoinItems(items, noLineBreakSpace = true){
+  if (!items.length) return '';
+  const groups = pdfYLines(items, 3);
+  return groups.map(g => {
+    let out = '';
+    let prevEnd = null;
+    g.items.forEach(it => {
+      if (prevEnd !== null && it.x - prevEnd > 1.5) out += ' ';
+      out += it.text;
+      prevEnd = it.x + it.width;
+    });
+    return out.trim();
+  }).filter(Boolean).join(noLineBreakSpace ? '' : ' ');
+}
+
+function pdfInferColumns(items){
+  const pageWidth = Math.max(...items.map(it => it.x + it.width), 800);
+  const header = pdfHeaderDetection(items);
+
+  if (header) {
+    const columns = {};
+    Object.entries(header.found).forEach(([k,v]) => columns[k] = v);
+    return {
+      columns,
+      bounds: pdfColumnBoundaries(columns, pageWidth),
+      headerY: header.y,
+      method: 'header'
+    };
+  }
+
+  // Header-less fallback. We still infer geometry from repeated date and numeric
+  // positions rather than using bank-specific coordinates.
+  const dateItems = items.filter(it => DATE_RE.test(it.text.trim()));
+  if (!dateItems.length) return null;
+
+  const dateX = dateItems.reduce((s,it) => s + it.x + it.width/2, 0) / dateItems.length;
+  const numeric = items.filter(it => pdfNumberValue(it.text) !== null);
+  const xBuckets = [];
+  numeric.forEach(it => {
+    const cx = it.x + it.width/2;
+    let b = xBuckets.find(x => Math.abs(x.center-cx) < 12);
+    if (!b) { b = {center:cx, count:0}; xBuckets.push(b); }
+    b.center = (b.center*b.count + cx)/(b.count+1);
+    b.count++;
+  });
+  xBuckets.sort((a,b)=>a.center-b.center);
+  const rightNumeric = xBuckets.filter(b => b.center > dateX + 80 && b.count >= 2);
+  if (!rightNumeric.length) return null;
+
+  const balanceBucket = rightNumeric[rightNumeric.length-1];
+  const amountBuckets = rightNumeric.slice(0,-1);
+  const narrationRight = amountBuckets.length ? amountBuckets[0].center : balanceBucket.center - 100;
+
+  const columns = {
+    date: {center:dateX},
+    narration: {center:(dateX+narrationRight)/2},
+    balance: {center:balanceBucket.center}
+  };
+  if (amountBuckets.length === 1) columns.amount = {center:amountBuckets[0].center};
+  else if (amountBuckets.length >= 2) {
+    columns.debit = {center:amountBuckets[amountBuckets.length-2].center};
+    columns.credit = {center:amountBuckets[amountBuckets.length-1].center};
+  }
+
+  return {
+    columns,
+    bounds: pdfColumnBoundaries(columns, pageWidth),
+    headerY: null,
+    method: 'geometry fallback'
+  };
+}
+
+function pdfFindDateAnchors(items, layout){
+  const dateBound = layout.bounds.date;
+  if (!dateBound) return [];
+  const candidates = items.filter(it =>
+    pdfItemInBound(it, dateBound) && DATE_RE.test(it.text.trim())
+  ).map(it => ({
+    date: it.text.trim(),
+    y: it.y,
+    x: it.x,
+    width: it.width
+  }));
+
+  candidates.sort((a,b)=>b.y-a.y);
+  const anchors = [];
+  candidates.forEach(a => {
+    const prior = anchors[anchors.length-1];
+    if (!prior || Math.abs(prior.y-a.y)>3.5) anchors.push(a);
+  });
+  return anchors;
+}
+
+function pdfNearestAnchor(y, anchors){
+  let best = null, bestDist = Infinity;
+  anchors.forEach(a => {
+    const d = Math.abs(a.y-y);
+    if (d < bestDist) { best=a; bestDist=d; }
+  });
+  return { anchor:best, distance:bestDist };
+}
+
+function pdfColumnItems(rowItems, bound){
+  return bound ? rowItems.filter(it => pdfItemInBound(it,bound)) : [];
+}
+
+function pdfExtractRow(anchor, rowItems, layout){
+  const b = layout.bounds;
+  const date = anchor.date;
+
+  // Narration is reconstructed only from the detected narration column.
+  // Physical line breaks are joined without adding artificial spaces.
+  const narration = pdfJoinItems(pdfColumnItems(rowItems,b.narration));
+
+  const valueDateItems = pdfColumnItems(rowItems,b.valueDate)
+    .filter(it => DATE_RE.test(it.text.trim()));
+  const valueDate = valueDateItems.length ? valueDateItems[0].text.trim() : '';
+
+  const readAmount = key => {
+    const its = pdfColumnItems(rowItems,b[key]);
+    const tokens = pdfNumericTokens(its);
+    if (!tokens.length) return '';
+    // Pick the right-most complete numeric token in the column. Bank statements
+    // normally right-align amounts, and this avoids accidentally returning a
+    // currency fragment or a split grouping component.
+    const token = tokens.sort((a,c)=>a.right-c.right)[tokens.length-1];
+    return pdfFormatAmount(token.value, token.text);
+  };
+
+  let debit = '', credit = '', amount = '', direction = '';
+  let amountSource = 'NONE';
+
+  if (b.debit || b.credit) {
+    debit = readAmount('debit');
+    credit = readAmount('credit');
+    if (debit || credit) amountSource = 'COLUMN_DC';
+  } else if (b.amount) {
+    amount = readAmount('amount');
+    if (amount) {
+      direction = pdfJoinItems(pdfColumnItems(rowItems,b.type)).trim();
+      const low = direction.toLowerCase();
+      if (/\bdr\b|debit|withdrawal/.test(low)) debit = amount;
+      else if (/\bcr\b|credit|deposit/.test(low)) credit = amount;
+      amountSource = direction ? 'COLUMN_AMOUNT_TYPE' : 'COLUMN_AMOUNT';
+    }
+  }
+
+  const balance = readAmount('balance');
+
+  // If a page uses an Amount column with no explicit Dr/Cr column, direction is
+  // deliberately left unresolved here. The balance pass can determine it later.
+  return {
+    date, narration, debit, credit, balance,
+    amountSource,
+    sourceDirection: direction,
+    _amount: amount,
+    valueDate,
+    estimated: false
+  };
+}
+
+async function extractPdfRows(file, onProgress){
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  const allRows = [];
+  const layoutMethods = [];
+  const detectedColumnSets = [];
+
+  for (let p=1; p<=pdf.numPages; p++) {
+    if (onProgress) onProgress(`Detecting columns — page ${p} of ${pdf.numPages}…`, 10 + (p/pdf.numPages)*70);
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    const items = content.items.map(it => ({
+      text: it.str,
+      x: it.transform[4],
+      y: it.transform[5],
+      width: it.width || 0,
+      height: Math.abs(it.transform[3]) || 0
+    })).filter(it => it.text.trim());
+
+    if (!items.length) continue;
+
+    const layout = pdfInferColumns(items);
+    if (!layout) continue;
+    layoutMethods.push(layout.method);
+    detectedColumnSets.push(Object.keys(layout.columns));
+
+    const anchors = pdfFindDateAnchors(items, layout);
+    if (!anchors.length) continue;
+
+    // Ignore the header and unrelated footer text by limiting assignment to the
+    // nearest transaction row. The limit is based on the median spacing between
+    // detected date anchors, so it adapts to different banks/font sizes.
+    const gaps = [];
+    for (let i=1;i<anchors.length;i++) {
+      const d=Math.abs(anchors[i-1].y-anchors[i].y);
+      if (d>2) gaps.push(d);
+    }
+    gaps.sort((a,b)=>a-b);
+    const medianGap = gaps.length ? gaps[Math.floor(gaps.length/2)] : 18;
+    const maxRowDistance = Math.max(8, Math.min(45, medianGap*0.72));
+
+    anchors.forEach(anchor => {
+      const rowItems = items.filter(it => {
+        const hit = pdfNearestAnchor(it.y, anchors);
+        return hit.anchor === anchor && hit.distance <= maxRowDistance;
+      });
+
+      // Exclude the header row itself if a date-like token somehow occurs in it.
+      if (layout.headerY !== null && Math.abs(anchor.y-layout.headerY) <= 4) return;
+
+      const row = pdfExtractRow(anchor, rowItems, layout);
+      if (!row.balance && !row.debit && !row.credit) return;
+      allRows.push(row);
+    });
+  }
+
+  const uniqueMethods = [...new Set(layoutMethods)];
+  const cols = [...new Set(detectedColumnSets.flat())];
+  const layoutSummary = `${uniqueMethods.join(' + ') || 'no layout detected'} · columns: ${cols.join(', ') || 'none'}`;
+
+  return { rawRows: allRows, numPages: pdf.numPages, layoutSummary };
+}
+
+// xlsx.full.min.js is already loaded for the Excel export, so it's reused here for
+// import too. Every sheet is scanned and the one with the most non-empty rows wins,
+// since a statement export can put the ledger on any tab (e.g. after a cover sheet).
+async function extractWorkbookAoa(file){
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type: 'array' });
+  let best = null;
+  wb.SheetNames.forEach(name => {
+    const ws = wb.Sheets[name];
+    const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' });
+    const nonEmptyRows = aoa.filter(r => r.some(c => String(c).trim() !== '')).length;
+    if (!best || nonEmptyRows > best.nonEmptyRows) best = { name, aoa, nonEmptyRows };
+  });
+  if (!best) throw new Error('workbook has no sheets');
+  return { aoa: best.aoa, sheetName: best.name };
+}
+
+// Minimal RFC4180-ish CSV parser: handles quoted fields, escaped quotes ("") inside
+// them, and quoted fields that themselves contain commas or newlines.
+function parseCsvText(text){
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') { if (text[i+1] === '"') { field += '"'; i++; } else inQuotes = false; }
+      else field += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\r') { /* ignore, \n (or EOF) ends the row */ }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else field += c;
+  }
+  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// Flattens a table into text lines (cells joined by spaces) so a spreadsheet/CSV with
+// no recognisable header can still be handed to the same line-based parser PDF uses.
+function linesFromAoa(aoa){
+  return aoa
+    .map(row => (row || []).map(c => (c == null ? '' : String(c).trim())).filter(Boolean).join(' '))
+    .filter(l => l.length > 0);
+}
+
+const TABLE_HEADER_PATTERNS = {
+  date: /\b(date|txn\s*date|value\s*date|transaction\s*date|posting\s*date)\b/i,
+  narration: /\b(narration|description|particulars|details|remarks|transaction\s*detail)\b/i,
+  debit: /\b(debit|withdrawal|dr\.?)\b/i,
+  credit: /\b(credit|deposit|cr\.?)\b/i,
+  balance: /\b(balance|closing\s*bal|running\s*bal)\b/i,
+  amount: /^\s*amount\s*$/i,
+  type: /^\s*(type|dr\/cr|drcr|indicator|txn\s*type)\s*$/i
+};
+
+// Scans the first few rows for a header: one that names a date column, a narration
+// column, and either separate debit/credit columns or a single amount(+type) column.
+function findHeaderRow(aoa){
+  const limit = Math.min(10, aoa.length);
+  for (let i = 0; i < limit; i++) {
+    const row = aoa[i];
+    if (!row) continue;
+    const colMap = {};
+    row.forEach((cell, ci) => {
+      const s = (cell == null ? '' : String(cell)).trim();
+      if (!s) return;
+      Object.keys(TABLE_HEADER_PATTERNS).forEach(key => {
+        if (colMap[key] === undefined && TABLE_HEADER_PATTERNS[key].test(s)) colMap[key] = ci;
+      });
+    });
+    const hasAmountish = colMap.debit !== undefined || colMap.credit !== undefined || colMap.amount !== undefined;
+    if (colMap.date !== undefined && colMap.narration !== undefined && hasAmountish) {
+      return { rowIndex: i, colMap };
+    }
+  }
+  return null;
+}
+
+// Converts an Excel date serial (SheetJS returns these as plain digit strings when a
+// cell holds a date-like number but no recognisable date format) into dd/mm/yyyy, so
+// it matches the same DATE_RE the PDF/text parser already understands.
+function normalizeDateCell(s){
+  if (s && /^\d{4,6}(\.0+)?$/.test(s)) {
+    const serial = parseFloat(s);
+    if (serial > 20000 && serial < 60000) {
+      const epoch = Date.UTC(1899, 11, 30);
+      const d = new Date(epoch + serial * 86400000);
+      const dd = String(d.getUTCDate()).padStart(2, '0');
+      const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+      return `${dd}/${mm}/${d.getUTCFullYear()}`;
+    }
+  }
+  return s;
+}
+
+// Strips currency symbols/commas/accounting parentheses from a cell and returns a
+// signed numeric string, or '' if the cell isn't a number.
+function parseNumberCell(s){
+  if (s == null) return '';
+  let str = String(s).trim();
+  if (!str) return '';
+  let neg = false;
+  if (/^\(.*\)$/.test(str)) { neg = true; str = str.slice(1, -1); }
+  str = str.replace(/[₹$,\s]/g, '');
+  if (!str || str === '-') return '';
+  const v = parseFloat(str);
+  if (!isFinite(v)) return '';
+  return (neg ? -Math.abs(v) : v).toFixed(2);
+}
+
+// Builds row objects directly from a table's mapped columns — no text reconstruction
+// needed since the source is already structured. Returns null if no header was found,
+// so the caller can fall back to line-based parsing instead.
+function rowsFromTable(aoa){
+  const header = findHeaderRow(aoa);
+  if (!header) return null;
+  const { rowIndex, colMap } = header;
+  const get = (row, idx) => (idx === undefined || row[idx] == null) ? '' : String(row[idx]).trim();
+  const out = [];
+
+  for (let i = rowIndex + 1; i < aoa.length; i++) {
+    const row = aoa[i];
+    if (!row || row.every(c => c == null || String(c).trim() === '')) continue;
+
+    const date = normalizeDateCell(get(row, colMap.date));
+    const narration = get(row, colMap.narration);
+    let debit = '', credit = '';
+    const balanceRaw = parseNumberCell(get(row, colMap.balance));
+    const balance = balanceRaw === '' ? '' : Math.abs(parseFloat(balanceRaw)).toFixed(2);
+
+    let amountSource = 'NONE', sourceDirection = '', _amount = '';
+    if (colMap.amount !== undefined) {
+      const amt = parseNumberCell(get(row, colMap.amount));
+      if (amt !== '') {
+        _amount = Math.abs(parseFloat(amt)).toFixed(2);
+        sourceDirection = get(row, colMap.type);
+        const typeStr = sourceDirection.toLowerCase();
+        const isDebit = /\bdr\b|debit|withdrawal/.test(typeStr);
+        const isCredit = /\bcr\b|credit|deposit/.test(typeStr);
+        if (isDebit) debit = _amount;
+        else if (isCredit) credit = _amount;
+        amountSource = sourceDirection ? 'COLUMN_AMOUNT_TYPE' : 'COLUMN_AMOUNT';
+      }
+    } else {
+      const debitRaw = parseNumberCell(get(row, colMap.debit));
+      const creditRaw = parseNumberCell(get(row, colMap.credit));
+      debit = debitRaw === '' ? '' : Math.abs(parseFloat(debitRaw)).toFixed(2);
+      credit = creditRaw === '' ? '' : Math.abs(parseFloat(creditRaw)).toFixed(2);
+      if (debit || credit) amountSource = 'COLUMN_DC';
+    }
+
+    if (!date && !narration && !debit && !credit && !balance) continue;
+    out.push({ date, narration, debit, credit, balance, amountSource, sourceDirection, _amount, estimated: false });
+  }
+  return out;
+}
+
+// ---------- Primary upload ----------
+async function handleFile(file){
+  hideAlert();
+  hideFallbackCard();
+  const ext = getExt(file.name);
+  if (!SUPPORTED_EXTS.includes(ext)) {
+    showAlert('That file type isn\'t supported yet. Please upload a PDF, XLSX, XLS, CSV, or TXT bank statement.');
+    return;
+  }
+
+  filenameEl.textContent = file.name;
+  filebar.style.display = 'flex';
+  dropzone.style.display = 'none';
+  progressLine.classList.add('on');
+  statusText.classList.add('on');
+  statusText.textContent = 'Reading file…';
+  progressBar.style.width = '5%';
+
+  try {
+    const { rawRows, sourceLabel, detail } = await extractRawRows(file, (msg, pct) => {
+      statusText.textContent = msg;
+      progressBar.style.width = pct + '%';
+    });
+    const { rows: processedRows, issueCount } = processRawRows(rawRows);
+    rows = processedRows;
+
+    progressBar.style.width = '100%';
+    const dupFlaggedCount = rows.filter(r => allFlags(r).some(f => f.code === 'LIKELY_DUPLICATE' || f.code === 'POSSIBLE_DUPLICATE')).length;
+    const unresolvedCount = rows.filter(r => !['DERIVED','COLUMN','MANUAL'].includes(r.typeConfidence)).length;
+    let doneMsg = `Done — ${rows.length} row(s) found from ${sourceLabel} (${detail}).`;
+    if (unresolvedCount > 0) doneMsg += ` ${unresolvedCount} row(s) couldn't be cleanly classified by balance — check the amber dot.`;
+    if (dupFlaggedCount > 0) doneMsg += ` ${dupFlaggedCount} row(s) flagged as possible duplicates — check the dot.`;
+    if (issueCount > 0) doneMsg += ` ${issueCount} row(s) failed validation — check the red dot.`;
+    statusText.textContent = doneMsg;
+
+    const quality = qualityScore(rows, issueCount);
+    primaryResult = { rows: rows.map(r => ({ ...r })), quality, issueCount, sourceLabel, fileName: file.name };
+    if (layoutText && sourceLabel === 'PDF') {
+      layoutText.textContent = `Detected PDF layout: ${detail}`;
+      layoutText.style.display = 'block';
+    }
+
+    if (rows.length === 0) {
+      showAlert('No transaction rows could be detected in this file. It may use a layout this tool doesn\'t recognise yet — you can still add rows manually below, or try the same statement in a different format.');
+    }
+
+    renderTable();
+    document.getElementById('section-review').style.display = 'block';
+    document.getElementById('section-export').style.display = 'block';
+    setRail(2);
+
+    if (quality < LOW_QUALITY_THRESHOLD) showFallbackPrompt(primaryResult, null);
+
+  } catch (err) {
+    console.error(err);
+    showAlert('Could not read this file (' + err.message + '). It may be encrypted, corrupted, or use a layout this tool can\'t parse.');
+    progressLine.classList.remove('on');
+    showFallbackPrompt(null, file.name);
+  }
+}
+
+// ---------- Fallback-format upload ----------
+function showFallbackPrompt(result, failedFileName){
+  if (result) {
+    const pct = Math.round(result.quality * 100);
+    fallbackHint.textContent = `The ${result.sourceLabel} extraction came out to ${result.rows.length} row(s) with ${result.issueCount} flagged issue(s) — about ${pct}% quality. If you have this statement in another format (Excel, CSV, or plain text), upload it below and Ledger will parse it separately so you can pick whichever result is cleaner.`;
+  } else {
+    fallbackHint.textContent = `Couldn't extract "${failedFileName}". If you have this statement in another format (Excel, CSV, or plain text), upload it below as a fallback.`;
+  }
+  fallbackCard.style.display = 'block';
+}
+
+function hideFallbackCard(){
+  fallbackCard.style.display = 'none';
+  fallbackChoice.style.display = 'none';
+  fallbackAlertBox.classList.remove('on');
+  fallbackStatusText.classList.remove('on');
+  fallbackFileInput.value = '';
+  fallbackResult = null;
+}
+
+fallbackDropzone.addEventListener('click', () => fallbackFileInput.click());
+fallbackDropzone.addEventListener('dragover', e => { e.preventDefault(); fallbackDropzone.classList.add('drag'); });
+fallbackDropzone.addEventListener('dragleave', () => fallbackDropzone.classList.remove('drag'));
+fallbackDropzone.addEventListener('drop', e => {
+  e.preventDefault(); fallbackDropzone.classList.remove('drag');
+  if (e.dataTransfer.files.length) handleFallbackFile(e.dataTransfer.files[0]);
+});
+fallbackFileInput.addEventListener('change', e => { if (e.target.files.length) handleFallbackFile(e.target.files[0]); });
+
+async function handleFallbackFile(file){
+  fallbackAlertBox.classList.remove('on');
+  fallbackChoice.style.display = 'none';
+  const ext = getExt(file.name);
+  if (!SUPPORTED_EXTS.includes(ext)) {
+    fallbackAlertBox.textContent = 'That file type isn\'t supported yet. Please upload a PDF, XLSX, XLS, CSV, or TXT file.';
+    fallbackAlertBox.classList.add('on');
+    return;
+  }
+
+  fallbackStatusText.classList.add('on');
+  fallbackStatusText.textContent = 'Reading fallback file…';
+
+  try {
+    const { rawRows, sourceLabel, detail } = await extractRawRows(file, msg => { fallbackStatusText.textContent = msg; });
+    const { rows: processedRows, issueCount } = processRawRows(rawRows);
+    const quality = qualityScore(processedRows, issueCount);
+    fallbackResult = { rows: processedRows.map(r => ({ ...r })), quality, issueCount, sourceLabel, fileName: file.name };
+
+    fallbackStatusText.textContent = `Fallback parsed — ${processedRows.length} row(s) from ${sourceLabel} (${detail}), ${issueCount} flagged issue(s).`;
+
+    if (processedRows.length === 0) {
+      fallbackAlertBox.textContent = 'No transaction rows could be detected in the fallback file either. Keeping the original result.';
+      fallbackAlertBox.classList.add('on');
+      return;
+    }
+
+    const primaryPct = primaryResult ? Math.round(primaryResult.quality * 100) : 0;
+    const fallbackPct = Math.round(quality * 100);
+    const recommendFallback = !primaryResult || quality > primaryResult.quality;
+
+    fallbackChoiceText.textContent =
+      (primaryResult ? `Original (${primaryResult.sourceLabel}): ${primaryResult.rows.length} row(s), ~${primaryPct}% quality. ` : '') +
+      `Fallback (${sourceLabel}): ${processedRows.length} row(s), ~${fallbackPct}% quality.` +
+      (primaryResult ? (recommendFallback ? ' The fallback looks cleaner.' : ' The original still looks cleaner.') : '');
+
+    useFallbackBtn.textContent = `Use fallback (${sourceLabel}, ${processedRows.length} rows)`;
+    keepPrimaryBtn.style.display = (primaryResult && primaryResult.rows.length) ? 'inline-block' : 'none';
+    if (primaryResult) keepPrimaryBtn.textContent = `Keep original (${primaryResult.sourceLabel}, ${primaryResult.rows.length} rows)`;
+    fallbackChoice.style.display = 'block';
+
+  } catch (err) {
+    console.error(err);
+    fallbackAlertBox.textContent = 'Could not read this fallback file (' + err.message + ').';
+    fallbackAlertBox.classList.add('on');
+  }
+}
+
+useFallbackBtn.addEventListener('click', () => {
+  if (!fallbackResult) return;
+  rows = fallbackResult.rows.map(r => ({ ...r }));
+  filenameEl.textContent = fallbackResult.fileName;
+  statusText.textContent = `Switched to fallback extraction — ${rows.length} row(s) from ${fallbackResult.sourceLabel}.`;
+  renderTable();
+  hideFallbackCard();
+});
+
+keepPrimaryBtn.addEventListener('click', () => {
+  if (primaryResult) {
+    rows = primaryResult.rows.map(r => ({ ...r }));
+    renderTable();
+  }
+  hideFallbackCard();
+});
+
+const DATE_RE = /^\s*(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}|\d{1,2}[\-\s](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\-\s,]?\d{2,4})/i;
+
+// Same date shapes as DATE_RE, but non-anchored and global — used to strip every
+// date-looking token out of a narration string wherever it occurs, not just a literal
+// repeat of one specific already-detected date string. See the narration-cleanup step
+// in parseLines() for why the anchored, single-literal-match approach wasn't enough.
+const DATE_TOKEN_RE = /\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}|\d{1,2}[\-\s](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\-\s,]?\d{2,4})\b/gi;
+
+// Matches amounts in Indian grouping (5,00,000.00 — groups of 2, then 3 before the
+// decimal), Western grouping (5,000,000.00 — groups of 3), or no grouping at all.
+// The previous regex hard-coded 3-digit comma groups only, so an Indian-formatted
+// amount like "5,00,000.00" partially matched as "00,000.00" → parsed as 0.00. That's
+// why large debits/credits (e.g. the 5,00,000 IMPS and 4,00,000 NEFT lines) were
+// disappearing instead of being read correctly.
+function extractAmounts(text){
+  const re = /-?\d(?:[\d,]*\d)?\.\d{2}(?!\d)/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const value = parseFloat(m[0].replace(/,/g,''));
+    if (!isFinite(value)) continue;
+    out.push({ raw: m[0], value, index: m.index, len: m[0].length });
+  }
+  return out;
+}
+
+function normalizeNarrationForDedupe(text){
+  return (text || '').toString().toUpperCase().replace(/\s+/g,' ').trim();
+}
+
+// Plain Levenshtein edit distance, converted to a 0-1 similarity ratio. Stdlib-only
+// (no dependency), same purpose as difflib.SequenceMatcher.ratio() in the Python
+// version of this logic.
+function levenshtein(a, b){
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = new Array(n + 1), curr = new Array(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n];
+}
+
+function textSimilarity(a, b){
+  if (!a && !b) return 1;
+  const maxLen = Math.max(a.length, b.length);
+  return maxLen === 0 ? 1 : 1 - levenshtein(a, b) / maxLen;
+}
+
+// Multi-factor duplicate detection: Date + Amount + derived Type + Narration
+// similarity. NEVER removes or merges a row — every match is a flag, keyed by
+// S.No, left for a human to resolve. Narration normalization deliberately stays
+// light (case/whitespace only) — it does NOT strip embedded reference numbers,
+// since those are frequently the one thing distinguishing two real transactions
+// that share a date, amount, and direction (e.g. two UPI payments to the same
+// payee for the same amount on the same day, with different reference IDs).
+const DUP_HIGH = 0.90;  // LIKELY_DUPLICATE
+const DUP_MED  = 0.60;  // POSSIBLE_DUPLICATE — narration only loosely similar
+
+function rowAmount(r){
+  return parseFloat(r.debit) || parseFloat(r.credit) || 0;
+}
+
+function detectDuplicates(rowsList){
+  // Pass 1 — same date + amount + direction: a real duplicate transaction.
+  // Narration decides whether it's flagged; if narration is materially
+  // different, two entries with the same date/amount/type are left alone —
+  // that's two real transactions, not one re-captured twice.
+  const groups = {};
+  rowsList.forEach(r => {
+    const key = r.date + '|' + rowAmount(r).toFixed(2) + '|' + (r.type || 'UNRESOLVED');
+    (groups[key] = groups[key] || []).push(r);
+  });
+  Object.values(groups).forEach(group => {
+    if (group.length < 2) return;
+    for (let a = 0; a < group.length; a++) {
+      for (let b = a + 1; b < group.length; b++) {
+        const ra = group[a], rb = group[b];
+        const sim = textSimilarity(normalizeNarrationForDedupe(ra.narration), normalizeNarrationForDedupe(rb.narration));
+        if (sim >= DUP_HIGH) {
+          addDynFlag(ra, 'LIKELY_DUPLICATE', 'WARN', `Same date/amount/direction as S.No ${rb.sno}, narration ${Math.round(sim*100)}% similar.`, [rb.sno]);
+          addDynFlag(rb, 'LIKELY_DUPLICATE', 'WARN', `Same date/amount/direction as S.No ${ra.sno}, narration ${Math.round(sim*100)}% similar.`, [ra.sno]);
+        } else if (sim >= DUP_MED) {
+          addDynFlag(ra, 'POSSIBLE_DUPLICATE', 'INFO', `Same date/amount/direction as S.No ${rb.sno}, narration only ${Math.round(sim*100)}% similar — verify.`, [rb.sno]);
+          addDynFlag(rb, 'POSSIBLE_DUPLICATE', 'INFO', `Same date/amount/direction as S.No ${ra.sno}, narration only ${Math.round(sim*100)}% similar — verify.`, [ra.sno]);
+        }
+        // below DUP_MED: narration too different — not flagged, treated as unique
+      }
+    }
+  });
+
+  // Pass 2 — same date + amount, OPPOSITE direction: informative, not an error.
+  // A debit and a later credit of the same amount is much more likely a
+  // reversal/refund than a coincidence, so it gets its own label rather than
+  // being lumped in with duplicates (which would either bury real dupes or
+  // raise false alarms on legitimate reversals).
+  const revGroups = {};
+  rowsList.forEach(r => {
+    const amt = rowAmount(r);
+    if (!amt) return;
+    const key = r.date + '|' + amt.toFixed(2);
+    (revGroups[key] = revGroups[key] || []).push(r);
+  });
+  Object.values(revGroups).forEach(group => {
+    const debits = group.filter(r => r.type === 'DEBIT');
+    const credits = group.filter(r => r.type === 'CREDIT');
+    debits.forEach(d => credits.forEach(c => {
+      addDynFlag(d, 'POSSIBLE_REVERSAL_PAIR', 'INFO', `Opposite-direction entry of the same amount at S.No ${c.sno} — likely a reversal/refund, not a duplicate.`, [c.sno]);
+      addDynFlag(c, 'POSSIBLE_REVERSAL_PAIR', 'INFO', `Opposite-direction entry of the same amount at S.No ${d.sno} — likely a reversal/refund, not a duplicate.`, [d.sno]);
+    }));
+  });
+}
+
+// Independent per-entry structural validation. Deliberately NOT a re-run of
+// classifyByBalanceDelta's own checks — this is a separate cross-check (date
+// present, exactly one of debit/credit populated, narration non-empty) so a bug
+// in one layer can't hide itself by re-confirming its own output. Adds ERROR-
+// severity dynamic flags; classification's own MISSING_BALANCE (also ERROR) is
+// counted here too via allFlags(), since both represent a real, unresolved gap.
+function validateRows(rowsList){
+  let issueCount = 0;
+  rowsList.forEach(r => {
+    if (!r.date || parseDateValue(r.date) === null) {
+      addDynFlag(r, 'MISSING_DATE', 'ERROR', 'Date is missing or not recognized.');
+    }
+    const hasDebit = r.debit !== '' && r.debit != null;
+    const hasCredit = r.credit !== '' && r.credit != null;
+    if (hasDebit && hasCredit) addDynFlag(r, 'BOTH_SIDES_SET', 'ERROR', 'Both debit and credit are set on the same row.');
+    if (hasDebit && !isFinite(parseFloat(r.debit))) addDynFlag(r, 'INVALID_DEBIT', 'ERROR', 'Debit is not a valid number.');
+    if (hasCredit && !isFinite(parseFloat(r.credit))) addDynFlag(r, 'INVALID_CREDIT', 'ERROR', 'Credit is not a valid number.');
+    if (!hasDebit && !hasCredit && (r.balance === '' || r.balance == null)) {
+      addDynFlag(r, 'NO_AMOUNT_OR_BALANCE', 'ERROR', 'No amount or balance found on this row.');
+    }
+    if (!r.narration || !r.narration.trim()) addDynFlag(r, 'EMPTY_NARRATION', 'ERROR', 'Narration is empty.');
+
+    if (allFlags(r).some(f => f.severity === 'ERROR')) issueCount++;
+  });
+  return issueCount;
+}
+
+function parseDateValue(dateStr){
+  // Returns a YYYYMMDD-shaped integer for chronological comparison, or null.
+  const months = {jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12};
+  let m = dateStr.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+  if (m) {
+    let [, d, mo, y] = m;
+    if (y.length === 2) y = '20' + y;
+    return parseInt(y,10)*10000 + parseInt(mo,10)*100 + parseInt(d,10);
+  }
+  m = dateStr.match(/^(\d{1,2})[\-\s](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\-\s,]?(\d{2,4})/i);
+  if (m) {
+    let [, d, mon, y] = m;
+    if (y.length === 2) y = '20' + y;
+    return parseInt(y,10)*10000 + months[mon.toLowerCase()]*100 + parseInt(d,10);
+  }
+  return null;
+}
+
+function addClassFlag(row, code, severity, message, relatedSno){
+  row.classificationFlags.push({ code, severity, message, relatedSno: relatedSno || [] });
+}
+function addDynFlag(row, code, severity, message, relatedSno){
+  row.dynamicFlags.push({ code, severity, message, relatedSno: relatedSno || [] });
+}
+
+// ---------- Balance-Delta Classification ----------
+// Ground truth is the running balance, not a "Debit/Credit" header or column —
+// even when a source table (XLSX/CSV) DOES have explicit Debit/Credit columns,
+// whatever value got provisionally read into r.debit/r.credit is only used
+// below as a cross-check, never to set the type. Runs exactly once, at parse
+// time — see the comment on processRawRows for why it must not re-run on edit.
+const BALANCE_TOLERANCE = 0.01;
+
+function classifyByBalanceDelta(rowsList){
+  if (!rowsList.length) return;
+
+  // Explicit detected amount columns are authoritative. The running balance is
+  // used to validate them. Only a single Amount column without a direction marker
+  // needs the balance to determine whether it is debit or credit.
+  const hasExplicitColumns = rowsList.some(r =>
+    r.amountSource === 'COLUMN_DC' || r.amountSource === 'COLUMN_AMOUNT_TYPE'
+  );
+
+  // Work in chronological order for balance comparisons, while preserving the
+  // statement's original display order.
+  let descending = true;
+  const dated = rowsList.filter(r => parseDateValue(r.date) !== null);
+  if (dated.length >= 2) {
+    const first = parseDateValue(dated[0].date), last = parseDateValue(dated[dated.length - 1].date);
+    if (first !== last) descending = first > last;
+  }
+  const order = [];
+  if (descending) { for (let i = rowsList.length - 1; i >= 0; i--) order.push(i); }
+  else { for (let i = 0; i < rowsList.length; i++) order.push(i); }
+
+  let lastKnownBalance = null, lastKnownSno = null, chainBroken = false;
+
+  order.forEach(i => {
+    const r = rowsList[i];
+    const bal = (r.balance !== '' && r.balance != null) ? parseFloat(r.balance) : NaN;
+    const statedDebit = parseFloat(r.debit) || 0;
+    const statedCredit = parseFloat(r.credit) || 0;
+    const statedAmount = (statedDebit || statedCredit) ? (statedDebit || statedCredit) : null;
+
+    // Explicit Debit/Credit or Amount+Dr/Cr columns.
+    if (r.amountSource === 'COLUMN_DC' || r.amountSource === 'COLUMN_AMOUNT_TYPE') {
+      if (statedDebit && !statedCredit) {
+        r.type = 'DEBIT'; r.typeConfidence = 'COLUMN';
+      } else if (statedCredit && !statedDebit) {
+        r.type = 'CREDIT'; r.typeConfidence = 'COLUMN';
+      } else if (!statedDebit && !statedCredit) {
+        r.type = 'UNRESOLVED'; r.typeConfidence = 'COLUMN';
+        addClassFlag(r, 'NO_COLUMN_AMOUNT', 'WARN', 'The detected amount column was empty for this transaction row.');
+      } else {
+        r.type = 'UNRESOLVED'; r.typeConfidence = 'COLUMN';
+        addClassFlag(r, 'BOTH_SIDES_SET', 'ERROR', 'Both detected Debit and Credit columns contain an amount on the same row.');
+      }
+
+      // Balance validation, never an overwrite.
+      if (isFinite(bal) && lastKnownBalance !== null && r.typeConfidence === 'COLUMN') {
+        const delta = bal - lastKnownBalance;
+        const expected = statedCredit - statedDebit;
+        if (Math.abs(delta - expected) > BALANCE_TOLERANCE) {
+          addClassFlag(r, 'BALANCE_AMOUNT_MISMATCH', 'WARN',
+            `Detected column amount(s) do not match the balance delta ₹${delta.toFixed(2)} — column value was retained; verify the source.`);
+        }
+      }
+
+      if (!isFinite(bal)) {
+        addClassFlag(r, 'MISSING_BALANCE', 'ERROR',
+          'Balance unreadable — amount came from the detected amount column, but balance validation could not be performed.');
+        chainBroken = true;
+      } else {
+        lastKnownBalance = bal; lastKnownSno = r.sno;
+        if (chainBroken) {
+          addClassFlag(r, 'CHAIN_RESUMED', 'INFO',
+            `First reliable balance since S.No ${lastKnownSno || 'an earlier row'} — balance validation resumed.`);
+          chainBroken = false;
+        }
+      }
+      return;
+    }
+
+    // Single Amount column without a direction marker.
+    if (r.amountSource === 'COLUMN_AMOUNT' && !statedDebit && !statedCredit) {
+      let resolved = false;
+      if (r.sourceDirection) {
+        const low = r.sourceDirection.toLowerCase();
+        if (/\bdr\b|debit|withdrawal/.test(low)) {
+          r.debit = r._amount || r.debit; resolved = true;
+        } else if (/\bcr\b|credit|deposit/.test(low)) {
+          r.credit = r._amount || r.credit; resolved = true;
+        }
+      }
+
+      if (!resolved && isFinite(bal) && lastKnownBalance !== null) {
+        const delta = bal - lastKnownBalance;
+        const amt = parseFloat(r._amount || 0);
+        if (Math.abs(delta - amt) <= BALANCE_TOLERANCE) {
+          r.credit = amt.toFixed(2); resolved = true;
+        } else if (Math.abs(delta + amt) <= BALANCE_TOLERANCE) {
+          r.debit = amt.toFixed(2); resolved = true;
+        }
+      }
+
+      if (resolved) {
+        r.type = r.debit ? 'DEBIT' : 'CREDIT';
+        r.typeConfidence = isFinite(bal) && lastKnownBalance !== null ? 'DERIVED' : 'COLUMN';
+      } else {
+        r.type = 'UNRESOLVED'; r.typeConfidence = 'COLUMN';
+        addClassFlag(r, 'AMBIGUOUS_AMOUNT_DIRECTION', 'WARN',
+          'Amount column detected, but debit/credit direction could not be proven from Dr/Cr or the running balance.');
+      }
+
+      if (!isFinite(bal)) {
+        addClassFlag(r, 'MISSING_BALANCE', 'ERROR',
+          'Balance unreadable — the single Amount column could not be direction-checked.');
+        chainBroken = true;
+      } else {
+        lastKnownBalance = bal; lastKnownSno = r.sno;
+        if (chainBroken) chainBroken = false;
+      }
+      return;
+    }
+
+    // Generic text/legacy parser path: balance remains the best available source
+    // of direction because no reliable physical amount column was detected.
+    if (!isFinite(bal)) {
+      r.type = 'UNRESOLVED';
+      r.typeConfidence = 'CHAIN_BROKEN';
+      addClassFlag(r, 'MISSING_BALANCE', 'ERROR',
+        'Balance unreadable — classification, and the next chronological row\'s delta, both depend on this value.');
+      chainBroken = true;
+      return;
+    }
+
+    if (lastKnownBalance === null) {
+      r.type = 'UNRESOLVED';
+      r.typeConfidence = 'OPENING';
+      addClassFlag(r, 'OPENING_ROW', 'INFO', 'No prior balance to compare against — treated as the anchor.');
+      lastKnownBalance = bal; lastKnownSno = r.sno;
+      return;
+    }
+
+    if (chainBroken) {
+      addClassFlag(r, 'CHAIN_RESUMED', 'INFO',
+        `First reliable balance since S.No ${lastKnownSno} — rows in between could not be classified by delta.`);
+      chainBroken = false;
+    }
+
+    const delta = bal - lastKnownBalance;
+    const magnitude = Math.abs(delta);
+
+    if (delta > BALANCE_TOLERANCE) {
+      r.type = 'CREDIT'; r.typeConfidence = 'DERIVED';
+      r.credit = magnitude.toFixed(2); r.debit = '';
+    } else if (delta < -BALANCE_TOLERANCE) {
+      r.type = 'DEBIT'; r.typeConfidence = 'DERIVED';
+      r.debit = magnitude.toFixed(2); r.credit = '';
+    } else {
+      r.type = 'UNRESOLVED'; r.typeConfidence = 'ZERO_DELTA';
+      addClassFlag(r, 'ZERO_DELTA', 'WARN',
+        `Balance unchanged from S.No ${lastKnownSno} — could be a same-amount reversal, a genuinely zero-value entry, or a duplicate. Needs manual read.`);
+    }
+
+    if (r.typeConfidence === 'DERIVED' && statedAmount !== null &&
+        Math.abs(statedAmount - magnitude) > BALANCE_TOLERANCE) {
+      addClassFlag(r, 'BALANCE_AMOUNT_MISMATCH', 'WARN',
+        `Stated amount ₹${statedAmount.toFixed(2)} doesn't match the balance delta ₹${magnitude.toFixed(2)} — the balance delta was used; verify against the source.`);
+    }
+
+    lastKnownBalance = bal; lastKnownSno = r.sno;
+  });
+}
+
+function mergeContinuationLine(blockText, line){
+  // A wrapped narration line was previously just appended to the very END of the
+  // row's accumulated text — but that end is *after* the Value Date/amount/balance
+  // columns (they all sit on the row's first visual line; only Narration overflows
+  // to a second line). Appending there glued the fragment onto the balance figure
+  // instead of back where the narration itself broke off. Instead, splice it in
+  // right before the first date-like or amount-like token that follows the leading
+  // Transaction Date — i.e. where the narration column actually ends.
+  const leadMatch = blockText.match(DATE_RE);
+  const searchFrom = leadMatch ? leadMatch[0].length : 0;
+  const boundaryRe = /\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}|\d[\d,]*\.\d{2}/;
+  const rest = blockText.slice(searchFrom);
+  const boundaryMatch = rest.match(boundaryRe);
+  const insertAt = boundaryMatch ? searchFrom + boundaryMatch.index : blockText.length;
+
+  const before = blockText.slice(0, insertAt).replace(/\s+$/, '');
+  const after = blockText.slice(insertAt);
+
+  // A PDF column can hard-wrap mid-token when a long, space-free run (a UPI handle,
+  // reference number, etc.) overflows the remaining column width — e.g. "...@PTHDF"
+  // continuing as "C" on the next line, which should rejoin as "...@PTHDFC", not
+  // "...@PTHDF C". Detect that specifically: the narration-so-far's last
+  // whitespace-delimited token is long (already deep inside an unbroken run) and the
+  // continuation is a short alnum fragment. A genuine short word after a genuine
+  // space (e.g. "BANK" then "LTD") is left alone, since "BANK" isn't a long run.
+  // PDF line wrapping is not a word separator. Preserve the narration exactly as
+  // the PDF lays it out: a continuation consisting of one unbroken token is normally
+  // the remainder of the same token (e.g. APPLESERVICES. + BDSI@HD, AXISBA + NK,
+  // HDFC + CBANK), so it must be concatenated with NO space. A continuation that
+  // contains multiple words (e.g. BANK LTD) represents actual spaces inside the
+  // continuation and therefore gets one separator before it.
+  //
+  // The only common one-word continuation that needs a separator is the interest
+  // narration's date range, e.g. "01-07-2025" + "to 31-07-2025".
+  const continuationHasInternalSpace = /\s/.test(line.trim());
+  const isDateRangeTo = /^to\b/i.test(line.trim());
+  const sep = (continuationHasInternalSpace || isDateRangeTo) ? ' ' : '';
+
+  return before + sep + line + (after ? ' ' + after : '');
+}
+
+function parseLines(lines){
+  // ---------- PASS 1: split raw text lines into per-transaction blocks ----------
+  // A new block starts whenever a line begins with a date; everything up to the next
+  // date-leading line (e.g. a wrapped second line of a long narration) belongs to it.
+  const blocks = [];
+  let currentBlock = null;
+
+  function pushBlock(){
+    if (!currentBlock) return;
+    const fullText = currentBlock.text;
+    const amounts = extractAmounts(fullText);
+    currentBlock = null;
+    if (amounts.length === 0) return; // no numbers at all — not a transaction line
+
+    // FIX: Narration credibility check (Type-D stub guard).
+    // A block whose narration is a very short, structure-free token
+    // (e.g. "NK", "XIS", "9@I") is almost certainly a mid-token fragment
+    // that picked up stray numbers from an adjacent PDF column.
+    // A credible narration has at least one of:
+    //   • a UPI/IMPS/NEFT/NACH/BILL payment keyword
+    //   • a slash or @ (reference number / VPA delimiter)
+    //   • at least 10 characters after stripping the date and amounts
+    const dateMatch = fullText.match(DATE_RE);
+    const dateStr   = dateMatch ? dateMatch[0] : '';
+    let   narrOnly  = fullText.replace(DATE_RE, '');
+    amounts.forEach(a => { narrOnly = narrOnly.split(a.raw).join(' '); });
+    narrOnly = narrOnly.replace(/\s+/g, ' ').trim();
+
+    const credible =
+      /\b(UPI|IMPS|NEFT|RTGS|NACH|INT\.PD|BILL|CAB|MB|CHEQUE|CHQ|ATM|POS|EMI|ACH)\b/i.test(narrOnly) ||
+      narrOnly.includes('/') ||
+      narrOnly.includes('@') ||
+      narrOnly.length >= 10;
+
+    if (!credible) {
+      // Stub block — attach its text to the previous block if one exists
+      if (blocks.length > 0) {
+        const prev = blocks[blocks.length - 1];
+        prev.rawText = mergeContinuationLine(prev.rawText, fullText.trim());
+        prev.amounts = extractAmounts(prev.rawText);
+      }
+      return;
+    }
+
+    blocks.push({
+      rawText: fullText,
+      date: dateStr.trim(),
+      dateValue: dateStr ? parseDateValue(dateStr.trim()) : null,
+      amounts
+    });
+  }
+
+  lines.forEach(line => {
+    // FIX: A new transaction block requires BOTH a date AND at least one
+    // numeric amount on the same physical line.
+    // Previously, any date-shaped line opened a new block — this caused
+    // Type-C continuations (e.g. "01-02-2026 to 28-02-2026", Value Date
+    // overflow lines) to be treated as new transactions, splitting narrations.
+    const lineHasDate    = DATE_RE.test(line);
+    const lineHasAmounts = extractAmounts(line).length > 0;
+
+    if (lineHasDate && lineHasAmounts) {
+      // Real transaction boundary: date + amounts on the same line
+      pushBlock();
+      currentBlock = { text: line };
+    } else if (currentBlock) {
+      // Everything else (date-only lines, narration overflow, mid-token
+      // fragments, date-range continuations) belongs to the current block.
+      if (line.length > 0 && !/^page\s+\d+/i.test(line)) {
+        currentBlock.text = mergeContinuationLine(currentBlock.text, line);
+      }
+    }
+    // Lines that arrive before any transaction has been seen (headers,
+    // column labels, etc.) are silently dropped — currentBlock is null.
+  });
+  pushBlock();
+
+  if (blocks.length === 0) return [];
+
+  // ---------- Detect statement order (oldest-first vs newest-first) ----------
+  // Many Indian bank statements list the newest transaction first. Telling debit from
+  // credit by running balance only works if you compare each row to the balance
+  // immediately BEFORE its own transaction — which, in a newest-first statement, is the
+  // row *below* it in the list, not the row above. Assuming oldest-first order (as the
+  // previous single-pass version implicitly did, via one running "previous balance"
+  // variable) silently inverted the comparison for every row, and also meant the very
+  // first row on every page had no usable prior balance at all and always fell back to
+  // a hard-coded "Debit" default — regardless of whether it actually was one.
+  const dated = blocks.filter(b => b.dateValue !== null);
+  let descending = true; // default: newest-first, the more common layout
+  if (dated.length >= 2) {
+    const first = dated[0].dateValue, last = dated[dated.length - 1].dateValue;
+    if (first !== last) descending = first > last;
+  }
+
+  // ---------- PASS 2: resolve debit / credit using the correct chronological neighbour ----------
+  const out = blocks.map((b, i) => {
+    const amounts = b.amounts;
+    let debit = '', credit = '', balance = '', estimated = false;
+
+    if (amounts.length === 1) {
+      // a lone number with no paired transaction amount — e.g. a "balance b/f" line
+      balance = amounts[0].value.toFixed(2);
+    } else {
+      const bal = amounts[amounts.length - 1];
+      balance = bal.value.toFixed(2);
+      const txAmounts = amounts.slice(0, amounts.length - 1);
+
+      // the block that represents the balance state immediately BEFORE this row's
+      // own transaction — one row later in the array for newest-first statements,
+      // one row earlier for oldest-first ones
+      const neighbour = blocks[descending ? i + 1 : i - 1];
+      const prevBalance = (neighbour && neighbour.amounts.length)
+        ? neighbour.amounts[neighbour.amounts.length - 1].value
+        : null;
+
+      if (txAmounts.length === 1) {
+        const amt = txAmounts[0];
+        // an explicit Dr/Cr marker right after the amount always wins over the heuristic
+        const after = b.rawText.slice(amt.index + amt.len, amt.index + amt.len + 6).toLowerCase();
+        if (/^\s*dr\b/.test(after)) {
+          debit = amt.value.toFixed(2);
+        } else if (/^\s*cr\b/.test(after)) {
+          credit = amt.value.toFixed(2);
+        } else if (prevBalance !== null) {
+          const delta = bal.value - prevBalance;
+          if (Math.abs(delta - amt.value) < 0.02) { credit = amt.value.toFixed(2); }
+          else if (Math.abs(delta + amt.value) < 0.02) { debit = amt.value.toFixed(2); }
+          else { debit = amt.value.toFixed(2); estimated = true; }
+        } else {
+          // edge of the statement — no neighbour to verify direction against
+          debit = amt.value.toFixed(2);
+          estimated = true;
+        }
+      } else {
+        // two transaction amounts on one line (both a withdrawal and a deposit column
+        // present): default to [debit, credit] column order, but check the balance
+        // delta and swap if the opposite order actually fits.
+        const a0 = txAmounts[0].value, a1 = txAmounts[1] ? txAmounts[1].value : 0;
+        let order = 'dc';
+        if (prevBalance !== null) {
+          const delta = bal.value - prevBalance;
+          const fitsDC = Math.abs(delta - (a1 - a0)) < 0.02;
+          const fitsCD = Math.abs(delta - (a0 - a1)) < 0.02;
+          if (fitsCD && !fitsDC) order = 'cd';
+          else if (!fitsDC && !fitsCD) estimated = true;
+        } else {
+          estimated = true;
+        }
+        if (order === 'dc') {
+          debit = a0 ? a0.toFixed(2) : '';
+          credit = a1 ? a1.toFixed(2) : '';
+        } else {
+          credit = a0 ? a0.toFixed(2) : '';
+          debit = a1 ? a1.toFixed(2) : '';
+        }
+      }
+    }
+
+    // ---------- Build a clean narration ----------
+    // Strip the leading date, every extracted amount, and stray Dr/Cr labels.
+    let narr = b.rawText.replace(DATE_RE, '').trim();
+    amounts.forEach(a => { narr = narr.split(a.raw).join(' '); });
+
+    // BUG FIX: a literal-string strip of just the one date that got detected as
+    // "the" transaction date only catches an EXACT repeat of that string. Bank
+    // statement lines routinely carry a second date that's the same calendar day
+    // but a different literal string — an un-padded twin ("25/3/2026" next to
+    // "25/03/2026"), a hyphen-separated interest-period range ("01-03-2026 to
+    // 31-03-2026"), or a repeated Value Date column in a different position — and
+    // every one of those slipped straight through into the narration untouched.
+    // Sweep out ANY date-shaped token, anywhere in the string, regardless of
+    // separator or digit padding, instead of matching one specific literal value.
+    narr = narr.replace(DATE_TOKEN_RE, ' ');
+
+    narr = narr.replace(/\b(dr|cr)\b/gi, ' ');
+    narr = narr.replace(/\s+/g, ' ').trim();
+    narr = narr.replace(/^[\/,\-:\s]+|[\/,\-:\s]+$/g, '');
+
+    return { date: b.date, narration: narr, debit, credit, balance };
+  });
+
+  return out;
+}
+
+// ---------- TABLE RENDER ----------
+const tbody = document.getElementById('tbody');
+
+function rowDots(r){
+  const flags = allFlags(r);
+  const dupMsgs = flags.filter(f => f.code === 'LIKELY_DUPLICATE' || f.code === 'POSSIBLE_DUPLICATE').map(f => f.message);
+  const revMsgs = flags.filter(f => f.code === 'POSSIBLE_REVERSAL_PAIR').map(f => f.message);
+  const errMsgs = flags.filter(f => f.severity === 'ERROR').map(f => f.message);
+  const uncertainMsgs = flags.filter(f => ['OPENING_ROW','ZERO_DELTA','CHAIN_RESUMED','MISSING_BALANCE','BALANCE_AMOUNT_MISMATCH'].includes(f.code)).map(f => f.message);
+
+  const showAmber = !['DERIVED','COLUMN','MANUAL'].includes(r.typeConfidence);
+  const showDup = dupMsgs.length > 0;
+  const showInfo = revMsgs.length > 0;
+  const showIssue = errMsgs.length > 0;
+
+  let html = '';
+  if (showAmber) html += `<span class="est-dot" title="${escapeHtml(uncertainMsgs.join('; ') || 'Balance-delta could not cleanly classify this row.')}"></span>`;
+  if (showDup) html += `<span class="dup-dot" title="${escapeHtml(dupMsgs.join('; '))}"></span>`;
+  if (showInfo) html += `<span class="info-dot" title="${escapeHtml(revMsgs.join('; '))}"></span>`;
+  if (showIssue) html += `<span class="issue-dot" title="${escapeHtml(errMsgs.join('; '))}"></span>`;
+  return html;
+}
+
+function renderTable(){
+  reprocessAnnotations(rows);
+  tbody.innerHTML = '';
+  rows.forEach((r, idx) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="num" style="color:var(--ink-soft);">${r.sno}</td>
+      <td contenteditable="true" data-field="date" data-idx="${idx}">${escapeHtml(r.date)}</td>
+      <td contenteditable="true" class="narration" data-field="narration" data-idx="${idx}">${rowDots(r)}${escapeHtml(r.narration)}</td>
+      <td contenteditable="true" class="num debit-cell" data-field="debit" data-idx="${idx}">${escapeHtml(r.debit)}</td>
+      <td contenteditable="true" class="num credit-cell" data-field="credit" data-idx="${idx}">${escapeHtml(r.credit)}</td>
+      <td contenteditable="true" class="num" data-field="balance" data-idx="${idx}">${escapeHtml(r.balance)}</td>
+      <td class="row-actions">
+        <button class="swap-btn" data-idx="${idx}" title="swap debit/credit">⇄</button>
+        <button class="del-btn" data-idx="${idx}" title="delete row">✕</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+  attachTableEvents();
+  updateSummary();
+  renderReport();
+}
+
+function escapeHtml(s){
+  return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function attachTableEvents(){
+  tbody.querySelectorAll('td[contenteditable]').forEach(td => {
+    td.addEventListener('blur', e => {
+      const idx = +td.dataset.idx;
+      const field = td.dataset.field;
+      let val = td.innerText.trim();
+      rows[idx][field] = val;
+      // A manual edit to anything balance-math-related supersedes the balance-delta
+      // call for this row — the user is now vouching for it directly, so the
+      // parse-time classification flags (which may reference the old value) are
+      // no longer trustworthy and are cleared rather than left stale.
+      if (field !== 'narration') {
+        rows[idx].typeConfidence = 'MANUAL';
+        rows[idx].classificationFlags = [];
+      }
+      renderTable();
+    });
+  });
+  tbody.querySelectorAll('.swap-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = +btn.dataset.idx;
+      const r = rows[idx];
+      [r.debit, r.credit] = [r.credit, r.debit];
+      r.type = r.debit ? 'DEBIT' : (r.credit ? 'CREDIT' : 'UNRESOLVED');
+      r.typeConfidence = 'MANUAL';
+      r.classificationFlags = [];
+      renderTable();
+    });
+  });
+  tbody.querySelectorAll('.del-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = +btn.dataset.idx;
+      rows.splice(idx, 1);
+      // Duplicate/reversal flags are rebuilt from scratch on every render (see
+      // reprocessAnnotations), so a row that only existed because of the one just
+      // deleted is dropped automatically — no manual cleanup needed here.
+      renderTable();
+    });
+  });
+}
+
+document.getElementById('addRow').addEventListener('click', () => {
+  rows.push({
+    sno: ++snoCounter, date: '', narration: '', debit: '', credit: '', balance: '',
+    type: 'UNRESOLVED', typeConfidence: 'MANUAL', classificationFlags: [], dynamicFlags: []
+  });
+  renderTable();
+});
+
+function updateSummary(){
+  let totalDebit = 0, totalCredit = 0;
+  rows.forEach(r => {
+    totalDebit += parseFloat(r.debit) || 0;
+    totalCredit += parseFloat(r.credit) || 0;
+  });
+  document.getElementById('statCount').textContent = rows.length;
+  document.getElementById('statDebit').textContent = totalDebit.toFixed(2);
+  document.getElementById('statCredit').textContent = totalCredit.toFixed(2);
+  const lastBal = rows.length ? rows[rows.length - 1].balance : '';
+  document.getElementById('statBalance').textContent = lastBal || '—';
+}
+
+// ---------- Processing Summary / Anomaly Report ----------
+const CODE_LABELS = {
+  OPENING_ROW: 'Opening/anchor row', MISSING_BALANCE: 'Balance missing',
+  NO_COLUMN_AMOUNT: 'Detected amount column empty', AMBIGUOUS_AMOUNT_DIRECTION: 'Amount direction ambiguous',
+  CHAIN_RESUMED: 'Balance chain resumed', ZERO_DELTA: 'Balance unchanged',
+  BALANCE_AMOUNT_MISMATCH: 'Stated amount vs. balance delta mismatch',
+  MISSING_DATE: 'Date missing/unrecognized', BOTH_SIDES_SET: 'Both debit & credit set',
+  INVALID_DEBIT: 'Debit not numeric', INVALID_CREDIT: 'Credit not numeric',
+  NO_AMOUNT_OR_BALANCE: 'No amount or balance', EMPTY_NARRATION: 'Narration empty'
+};
+const FIELD_BY_CODE = {
+  MISSING_DATE: 'date', BOTH_SIDES_SET: 'debit/credit', INVALID_DEBIT: 'debit',
+  INVALID_CREDIT: 'credit', NO_AMOUNT_OR_BALANCE: 'balance', EMPTY_NARRATION: 'narration'
+};
+
+function generateReport(rowsList){
+  const classIssues = [];   // { sno, code, detail }
+  const dupRows = [];       // { sno, relatedSno, date, amount, similarity, verdict }
+  const fieldIssues = [];   // { sno, field, issue }
+  const seenPairs = new Set();
+  let cleanlyDerived = 0;
+
+  rowsList.forEach(r => {
+    if (['DERIVED','COLUMN'].includes(r.typeConfidence)) cleanlyDerived++;
+
+    (r.classificationFlags || []).forEach(f => {
+      classIssues.push({ sno: r.sno, code: f.code, detail: f.message });
+    });
+
+    (r.dynamicFlags || []).forEach(f => {
+      if (f.code === 'LIKELY_DUPLICATE' || f.code === 'POSSIBLE_DUPLICATE' || f.code === 'POSSIBLE_REVERSAL_PAIR') {
+        const other = f.relatedSno[0];
+        const pairKey = [r.sno, other].sort((a,b) => a - b).join('-') + '|' + f.code;
+        if (seenPairs.has(pairKey)) return;
+        seenPairs.add(pairKey);
+        const simMatch = f.message.match(/(\d+)%/);
+        dupRows.push({
+          sno: r.sno, relatedSno: other, date: r.date,
+          amount: rowAmount(r).toFixed(2),
+          similarity: simMatch ? simMatch[1] + '%' : '—',
+          verdict: f.code
+        });
+      } else if (f.severity === 'ERROR') {
+        fieldIssues.push({ sno: r.sno, field: FIELD_BY_CODE[f.code] || 'row', issue: f.message });
+      }
+    });
+  });
+
+  return {
+    total: rowsList.length,
+    cleanlyDerived,
+    classIssues, dupRows, fieldIssues,
+    flaggedRowCount: new Set(fieldIssues.map(x => x.sno).concat(classIssues.filter(c => c.code === 'MISSING_BALANCE').map(c => c.sno))).size
+  };
+}
+
+function reportTable(headers, rowsHtml){
+  if (!rowsHtml.length) return `<p class="hint" style="margin:8px 0 0;">None.</p>`;
+  return `<div class="table-scroll" style="margin-top:8px;"><table style="min-width:0;"><thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rowsHtml.join('')}</tbody></table></div>`;
+}
+
+function renderReport(){
+  const panel = document.getElementById('reportPanel');
+  if (!panel) return;
+  if (!rows.length) { panel.innerHTML = ''; return; }
+
+  const rpt = generateReport(rows);
+
+  const classRowsHtml = rpt.classIssues.map(c => `<tr><td class="num">${c.sno}</td><td>${escapeHtml(CODE_LABELS[c.code] || c.code)}</td><td>${escapeHtml(c.detail)}</td></tr>`);
+  const dupRowsHtml = rpt.dupRows.map(d => `<tr><td class="num">${d.sno}</td><td class="num">${d.relatedSno}</td><td>${escapeHtml(d.date)}</td><td class="num">${d.amount}</td><td class="num">${d.similarity}</td><td>${escapeHtml(CODE_LABELS[d.verdict] || d.verdict)}</td></tr>`);
+  const fieldRowsHtml = rpt.fieldIssues.map(f => `<tr><td class="num">${f.sno}</td><td>${escapeHtml(f.field)}</td><td>${escapeHtml(f.issue)}</td></tr>`);
+
+  panel.innerHTML = `
+    <h2 style="margin-top:0;">Processing Summary</h2>
+    <p class="hint">Every finding below is keyed by S.No — cross-reference it against the table above. Nothing here has been removed from the data; these are annotations only.</p>
+
+    <h3 style="font-size:14px;margin:18px 0 0;">A. Classification issues (balance-delta)</h3>
+    ${reportTable(['S.No','Code','Detail'], classRowsHtml)}
+
+    <h3 style="font-size:14px;margin:18px 0 0;">B. Duplicate / reversal detection</h3>
+    ${reportTable(['S.No','Related S.No','Date','Amount','Similarity','Verdict'], dupRowsHtml)}
+
+    <h3 style="font-size:14px;margin:18px 0 0;">C. Missing / invalid fields</h3>
+    ${reportTable(['S.No','Field','Issue'], fieldRowsHtml)}
+
+    <h3 style="font-size:14px;margin:18px 0 0;">D. Summary</h3>
+    <ul style="margin:8px 0 0;padding-left:20px;font-size:13px;color:var(--ink-soft);">
+      <li>Rows processed: ${rpt.total} — cleanly classified by balance delta: ${rpt.cleanlyDerived} (${rpt.total ? Math.round(rpt.cleanlyDerived/rpt.total*100) : 0}%)</li>
+      <li>Classification issues: ${rpt.classIssues.length}</li>
+      <li>Duplicate/reversal pairs flagged: ${rpt.dupRows.length}</li>
+      <li>Rows with missing/invalid fields: ${new Set(rpt.fieldIssues.map(f => f.sno)).size}</li>
+    </ul>
+  `;
+}
+
+// ---------- EXPORTS ----------
+document.getElementById('exportXlsx').addEventListener('click', () => {
+  if (!rows.length) { showAlert('There are no rows to export yet.'); return; }
+  const data = [['S.No','Date','Narration','Debit','Credit','Balance']];
+  rows.forEach((r, idx) => data.push([idx + 1, r.date, r.narration, r.debit ? +r.debit : '', r.credit ? +r.credit : '', r.balance ? +r.balance : '']));
+  const ws = XLSX.utils.aoa_to_sheet(data);
+  ws['!cols'] = [{wch:7},{wch:12},{wch:48},{wch:12},{wch:12},{wch:14}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Statement');
+  XLSX.writeFile(wb, 'bank_statement_extracted.xlsx');
+});
+
+function toTallyDate(dateStr){
+  // try to normalise dd/mm/yyyy, dd-mm-yyyy, dd Mon yyyy → YYYYMMDD
+  const months = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+  let m = dateStr.match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+  if (m) {
+    let [_, d, mo, y] = m;
+    if (y.length === 2) y = '20' + y;
+    return y + mo.padStart(2,'0') + d.padStart(2,'0');
+  }
+  m = dateStr.match(/(\d{1,2})[\-\s](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\-\s,]?(\d{2,4})/i);
+  if (m) {
+    let [_, d, mon, y] = m;
+    if (y.length === 2) y = '20' + y;
+    return y + months[mon.toLowerCase()] + d.padStart(2,'0');
+  }
+  return '';
+}
+
+function xmlEscape(s){
+  return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+document.getElementById('exportTally').addEventListener('click', () => {
+  if (!rows.length) { showAlert('There are no rows to export yet.'); return; }
+  const bankLedger = document.getElementById('bankLedger').value.trim() || 'Bank Account';
+  const suspenseLedger = document.getElementById('suspenseLedger').value.trim() || 'Suspense Account';
+  const company = document.getElementById('companyName').value.trim();
+
+  let vchCounter = 0;
+  let messages = '';
+
+  rows.forEach(r => {
+    const amt = parseFloat(r.debit) || parseFloat(r.credit) || 0;
+    if (!amt) return;
+    const isDebit = !!parseFloat(r.debit);
+    const vchType = isDebit ? 'Payment' : 'Receipt';
+    const date = toTallyDate(r.date);
+    vchCounter++;
+
+    // Payment: bank is credited (money out) -> ISDEEMEDPOSITIVE No for bank, Yes for suspense
+    // Receipt: bank is debited (money in) -> ISDEEMEDPOSITIVE Yes for bank, No for suspense
+    const bankPositive = isDebit ? 'No' : 'Yes';
+    const suspensePositive = isDebit ? 'Yes' : 'No';
+    const bankAmount = isDebit ? amt.toFixed(2) : (-amt).toFixed(2);
+    const suspenseAmount = isDebit ? (-amt).toFixed(2) : amt.toFixed(2);
+
+    messages += `
+    <TALLYMESSAGE xmlns:UDF="TallyUDF">
+     <VOUCHER VCHTYPE="${vchType}" ACTION="Create">
+      <DATE>${date}</DATE>
+      <NARRATION>${xmlEscape(r.narration)}</NARRATION>
+      <VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME>
+      <VOUCHERNUMBER>${vchCounter}</VOUCHERNUMBER>
+      <PARTYLEDGERNAME>${xmlEscape(bankLedger)}</PARTYLEDGERNAME>
+      <ALLLEDGERENTRIES.LIST>
+       <LEDGERNAME>${xmlEscape(bankLedger)}</LEDGERNAME>
+       <ISDEEMEDPOSITIVE>${bankPositive}</ISDEEMEDPOSITIVE>
+       <AMOUNT>${bankAmount}</AMOUNT>
+      </ALLLEDGERENTRIES.LIST>
+      <ALLLEDGERENTRIES.LIST>
+       <LEDGERNAME>${xmlEscape(suspenseLedger)}</LEDGERNAME>
+       <ISDEEMEDPOSITIVE>${suspensePositive}</ISDEEMEDPOSITIVE>
+       <AMOUNT>${suspenseAmount}</AMOUNT>
+      </ALLLEDGERENTRIES.LIST>
+     </VOUCHER>
+    </TALLYMESSAGE>`;
+  });
+
+  const staticVars = company
+    ? `<STATICVARIABLES><SVCURRENTCOMPANY>${xmlEscape(company)}</SVCURRENTCOMPANY></STATICVARIABLES>`
+    : '';
+
+  const xml = `<ENVELOPE>
+ <HEADER>
+  <TALLYREQUEST>Import Data</TALLYREQUEST>
+ </HEADER>
+ <BODY>
+  <IMPORTDATA>
+   <REQUESTDESC>
+    <REPORTNAME>Vouchers</REPORTNAME>
+    ${staticVars}
+   </REQUESTDESC>
+   <REQUESTDATA>${messages}
+   </REQUESTDATA>
+  </IMPORTDATA>
+ </BODY>
+</ENVELOPE>`;
+
+  const blob = new Blob([xml], { type: 'application/xml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'bank_statement_tally.xml';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+});
+</script>
+<script>
+// Export reliability patch — does not alter extraction/parsing logic.
+// These handlers are bound independently so a parsing-side exception cannot
+// accidentally remove the two download actions from the UI.
+(function () {
+  function getRows() {
+    try { return Array.isArray(rows) ? rows : []; } catch (e) { return []; }
+  }
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+  }
+
+  const xlsxBtn = document.getElementById('exportXlsx');
+  const tallyBtn = document.getElementById('exportTally');
+
+  if (xlsxBtn) {
+    xlsxBtn.onclick = function (ev) {
+      ev.preventDefault();
+      const dataRows = getRows();
+      if (!dataRows.length) { showAlert('There are no rows to export yet.'); return; }
+      if (typeof XLSX === 'undefined') {
+        showAlert('Excel export library could not be loaded. Please reconnect to the internet and reopen the tool.');
+        return;
+      }
+      const data = [['S.No','Date','Narration','Debit','Credit','Balance']];
+      dataRows.forEach((r, idx) => data.push([
+        idx + 1, r.date || '', r.narration || '',
+        r.debit ? +r.debit : '', r.credit ? +r.credit : '', r.balance ? +r.balance : ''
+      ]));
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      ws['!cols'] = [{wch:7},{wch:12},{wch:60},{wch:12},{wch:12},{wch:14}];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Statement');
+      XLSX.writeFile(wb, 'bank_statement_extracted.xlsx');
+    };
+  }
+
+  if (tallyBtn) {
+    tallyBtn.onclick = function (ev) {
+      ev.preventDefault();
+      const dataRows = getRows();
+      if (!dataRows.length) { showAlert('There are no rows to export yet.'); return; }
+      const bankLedger = (document.getElementById('bankLedger')?.value || '').trim() || 'Bank Account';
+      const suspenseLedger = (document.getElementById('suspenseLedger')?.value || '').trim() || 'Suspense Account';
+      const company = (document.getElementById('companyName')?.value || '').trim();
+      let vchCounter = 0, messages = '';
+      dataRows.forEach(r => {
+        const amt = parseFloat(r.debit) || parseFloat(r.credit) || 0;
+        if (!amt) return;
+        const isDebit = !!parseFloat(r.debit);
+        const vchType = isDebit ? 'Payment' : 'Receipt';
+        const date = toTallyDate(r.date || '');
+        if (!date) return;
+        vchCounter++;
+        const bankPositive = isDebit ? 'No' : 'Yes';
+        const suspensePositive = isDebit ? 'Yes' : 'No';
+        const bankAmount = isDebit ? amt.toFixed(2) : (-amt).toFixed(2);
+        const suspenseAmount = isDebit ? (-amt).toFixed(2) : amt.toFixed(2);
+        messages += `
+    <TALLYMESSAGE xmlns:UDF="TallyUDF">
+     <VOUCHER VCHTYPE="${vchType}" ACTION="Create">
+      <DATE>${date}</DATE>
+      <NARRATION>${xmlEscape(r.narration || '')}</NARRATION>
+      <VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME>
+      <VOUCHERNUMBER>${vchCounter}</VOUCHERNUMBER>
+      <PARTYLEDGERNAME>${xmlEscape(bankLedger)}</PARTYLEDGERNAME>
+      <ALLLEDGERENTRIES.LIST>
+       <LEDGERNAME>${xmlEscape(bankLedger)}</LEDGERNAME>
+       <ISDEEMEDPOSITIVE>${bankPositive}</ISDEEMEDPOSITIVE>
+       <AMOUNT>${bankAmount}</AMOUNT>
+      </ALLLEDGERENTRIES.LIST>
+      <ALLLEDGERENTRIES.LIST>
+       <LEDGERNAME>${xmlEscape(suspenseLedger)}</LEDGERNAME>
+       <ISDEEMEDPOSITIVE>${suspensePositive}</ISDEEMEDPOSITIVE>
+       <AMOUNT>${suspenseAmount}</AMOUNT>
+      </ALLLEDGERENTRIES.LIST>
+     </VOUCHER>
+    </TALLYMESSAGE>`;
+      });
+      if (!messages) { showAlert('No valid debit/credit rows were available for Tally export.'); return; }
+      const staticVars = company
+        ? `<STATICVARIABLES><SVCURRENTCOMPANY>${xmlEscape(company)}</SVCURRENTCOMPANY></STATICVARIABLES>` : '';
+      const xml = `<ENVELOPE>
+ <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
+ <BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME>${staticVars}</REQUESTDESC>
+ <REQUESTDATA>${messages}
+ </REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+      downloadBlob(new Blob([xml], {type:'application/xml;charset=utf-8'}), 'bank_statement_tally.xml');
+    };
+  }
+})();
+</script>
+
+<div class="creator-rights-notice" id="creator-rights-notice">
+  <strong>© 2026 Ismail Ahmad — All Rights Reserved.</strong><br>
+  This tool and its source code are the intellectual property of Ismail Ahmad.
+  No copying, reproduction, redistribution, modification, alteration, reverse engineering, or reuse of the source code is permitted without prior written permission from the creator.
+  <br>Contact: <a href="mailto:ismailahmad94282@gmail.com">ismailahmad94282@gmail.com</a> | <a href="tel:+919310794282">+91 9310794282</a>
+</div>
+</body>
+</html>
