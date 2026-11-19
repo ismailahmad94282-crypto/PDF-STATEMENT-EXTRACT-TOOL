@@ -6,8 +6,8 @@
 <title>Ledger — Bank Statement Extractor v2</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" onerror="window.__pdfJsLoadFailed=true;"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" onerror="window.__xlsxLoadFailed=true;"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
   :root{
     --paper:#F7F4EC;
@@ -322,7 +322,7 @@
 
       <div class="table-tools">
         <div class="legend"><span class="est-dot"></span> balance-delta couldn't cleanly classify this row (opening anchor, broken balance chain, or zero change) — see Processing Summary</div>
-        <div class="legend"><span class="dup-dot"></span> possible duplicate — same date, amount &amp; direction as another row, narration similar; never auto-removed — review manually</div>
+        <div class="legend"><span class="dup-dot"></span> duplicate match — normalized date, amount &amp; narration all match; never auto-removed — review manually</div>
         <div class="legend"><span class="info-dot"></span> possible reversal pair — same date &amp; amount, opposite direction; informational, not an error</div>
         <div class="legend"><span class="issue-dot"></span> failed structural validation — missing date, missing balance, or empty narration; hover for details</div>
         <button class="ghost" id="addRow">+ add row</button>
@@ -359,17 +359,1068 @@
 
 </div>
 
-<script>
-// GUARD (bug fix): see extractPdfRows() for where this is actually invoked, and
-// the comment above the <script src> tags above for what this guards against.
-function ensurePdfJsReady(){
-  if (typeof pdfjsLib === 'undefined') {
-    throw new Error('PDF support library (pdf.js) failed to load from the CDN — check your internet connection or any content blocker, or upload this statement as CSV/Excel/TXT instead.');
+<script id="statement-engine">
+/* =====================================================================
+   Universal bank-statement PDF engine  (bank-agnostic, geometry + arithmetic driven)
+   Input : pages = [{ width, height, items:[{str,x,y,w,h}] }]   (y grows downward)
+   Output: { ok, rows:[{date,narration,debit,credit,balance,warn}], info, warnings, ... }
+   ===================================================================== */
+(function (root) {
+'use strict';
+
+// ---------------------------------------------------------------- utilities
+const median = a => { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+const percentile = (a, p) => { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.max(0, Math.round((s.length - 1) * p)))]; };
+const sum = a => a.reduce((x, y) => x + y, 0);
+const pad2 = n => String(n).padStart(2, '0');
+
+function clusterValues(entries, tol) {          // entries: [{v, ...}]
+  const s = [...entries].sort((a, b) => a.v - b.v);
+  const out = [];
+  s.forEach(e => {
+    const c = out[out.length - 1];
+    if (c && e.v - c.max <= tol) { c.items.push(e); c.max = e.v; c.sum += e.v; }
+    else out.push({ items: [e], min: e.v, max: e.v, sum: e.v });
+  });
+  out.forEach(c => { c.n = c.items.length; c.center = c.sum / c.n; });
+  return out;
+}
+
+// Choose the alignment (left / right / centre) under which a set of segments forms the
+// tightest vertical stripes. Dates are usually left-aligned, amounts right-aligned.
+function bestAlignment(segs, tol) {
+  let best = null;
+  ['x1', 'x0', 'xc'].forEach(al => {
+    const cl = clusterValues(segs.map(s => ({ v: al === 'xc' ? (s.x0 + s.x1) / 2 : s[al], s })), tol)
+      .filter(c => c.n >= 1);
+    const spread = sum(cl.map(c => c.n * (c.max - c.min))) / Math.max(1, segs.length);
+    const score = spread + 0.35 * cl.length;      // tight stripes, few of them
+    if (!best || score < best.score - 1e-9) best = { al, clusters: cl, score };
+  });
+  return best;
+}
+
+// ---------------------------------------------------------------- dates
+const MONTH = '(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
+const DATE_PATS = [
+  { kind: 'ymd',  re: /^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?!\d)/ },
+  { kind: 'num',  re: /^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})(?!\d)/ },
+  { kind: 'dmon', re: new RegExp('^(\\d{1,2})(?:st|nd|rd|th)?[\\s\\-\\/.,]*(' + MONTH + ')[a-z]*\\.?[\\s\\-\\/.,]*(\\d{4}|\\d{2})(?!\\d)', 'i') },
+  { kind: 'mond', re: new RegExp('^(' + MONTH + ')[a-z]*\\.?[\\s\\-\\/.]*(\\d{1,2})(?:st|nd|rd|th)?[\\s,\\-\\/.]*(\\d{4})(?!\\d)', 'i') },
+];
+const MONTH_IDX = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+
+function matchDate(text) {                     // date at the START of text
+  const t = String(text).trim();
+  if (!/^[\dA-Za-z]/.test(t)) return null;
+  for (const p of DATE_PATS) {
+    const m = t.match(p.re);
+    if (m) return { kind: p.kind, len: m[0].length, text: m[0], g: m.slice(1) };
   }
-  if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  return null;
+}
+
+// ---------------------------------------------------------------- money
+function parseMoney(raw) {
+  if (raw == null) return null;
+  let s = String(raw).replace(/[   ​]/g, ' ').replace(/[−–—]/g, '-').replace(/\s+/g, ' ').trim();
+  if (!s || s.length > 30 || !/\d/.test(s)) return null;
+  let suffix = null, m;
+  if ((m = s.match(/^(.*?[\d)])\s*[(\[]?\s*(dr|cr|d|c)\s*\.?\s*[)\]]?\s*$/i))) { suffix = m[2]; s = m[1].trim(); }
+  else if ((m = s.match(/^[(\[]?\s*(dr|cr)\s*\.?\s*[)\]]?\s*(.*\d.*)$/i))) { suffix = m[1]; s = m[2].trim(); }
+  let neg = false, plus = false;
+  s = s.replace(/^(?:rs\.?|inr|usd|eur|gbp|[₹$€£])\s*/i, '');
+  if (/^\(.*\)$/.test(s)) { neg = true; s = s.slice(1, -1).trim(); }
+  if (/^-/.test(s)) { neg = true; s = s.replace(/^-+\s*/, ''); }
+  else if (/^\+/.test(s)) { plus = true; s = s.replace(/^\++\s*/, ''); }
+  if (/-$/.test(s)) { neg = true; s = s.replace(/\s*-+$/, ''); }
+  s = s.replace(/^(?:rs\.?|inr|usd|eur|gbp|[₹$€£])\s*/i, '').trim();
+  if (!/^[\d.,\s]+$/.test(s) || !/\d/.test(s)) return null;
+  s = s.replace(/\s+/g, '');
+  let body, grouping = false;
+  if (/^\d{1,3}(?:\.\d{3})+,\d{1,2}$/.test(s)) { body = s.replace(/\./g, '').replace(',', '.'); grouping = true; }
+  else if (/^\d{1,3}(?:,\d{2,3})+(?:\.\d+)?$/.test(s)) { body = s.replace(/,/g, ''); grouping = true; }
+  else if (/^\d+(?:\.\d+)?$/.test(s)) body = s;
+  else if (/^\d+,\d{1,2}$/.test(s)) body = s.replace(',', '.');
+  else return null;
+  const digits = body.replace('.', '');
+  if (digits.length > 15) return null;
+  const value = Number(body);
+  if (!isFinite(value)) return null;
+  const decimals = body.includes('.') ? body.split('.')[1].length : 0;
+  return {
+    value, decimals, grouping,
+    sign: neg ? -1 : (plus ? 1 : 0),
+    dir: suffix ? (suffix[0].toLowerCase() === 'd' ? 'dr' : 'cr') : null,
+    raw: String(raw).trim(),
+  };
+}
+// A "money-like" token has a decimal part or digit grouping (so cheque numbers / refs are not money).
+const isMoneyLike = m => !!m && (m.decimals > 0 || m.grouping) && m.decimals <= 3;
+
+// ---------------------------------------------------------------- PDF.js -> pages adapter
+async function pagesFromPdf(pdf, pdfjsLib, onProgress) {
+  const pages = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    if (onProgress) onProgress(p, pdf.numPages);
+    const page = await pdf.getPage(p);
+    const vp = page.getViewport({ scale: 1 });
+    const tc = await page.getTextContent();
+    const raw = [];
+    for (const it of tc.items) {
+      if (typeof it.str !== 'string' || !it.str.trim()) continue;
+      const tx = pdfjsLib.Util.transform(vp.transform, it.transform);
+      const len = Math.hypot(tx[0], tx[1]) || 1;
+      raw.push({ str: it.str, ux: tx[0] / len, uy: tx[1] / len, ex: tx[4], ey: tx[5], w: Math.abs(it.width) || 0, h: Math.hypot(tx[2], tx[3]) || len });
+    }
+    // Dominant reading direction (handles pages stored rotated); other angles (watermarks) are dropped.
+    const bins = {};
+    raw.forEach(r => { const a = Math.round(Math.atan2(r.uy, r.ux) / (Math.PI / 2)); bins[a] = (bins[a] || 0) + r.str.length; });
+    let dom = 0, domN = -1; Object.keys(bins).forEach(k => { if (bins[k] > domN) { domN = bins[k]; dom = +k; } });
+    const ang = dom * Math.PI / 2, ux = Math.cos(ang), uy = Math.sin(ang), vx = -uy, vy = ux;
+    const items = [];
+    raw.forEach(r => {
+      if (Math.abs(r.ux * ux + r.uy * uy) < 0.985) return;           // not along the dominant direction
+      items.push({ str: r.str, x: r.ex * ux + r.ey * uy, y: r.ex * vx + r.ey * vy, w: r.w, h: r.h });
+    });
+    pages.push({ width: (dom % 2 ? vp.height : vp.width), height: (dom % 2 ? vp.width : vp.height), items });
+  }
+  return pages;
+}
+
+// ---------------------------------------------------------------- header vocabulary
+const ROLE_RES = [
+  ['valueDate', /\b(?:value|val)\s*(?:date|dt)\b|\bvalue\b/],
+  ['date',      /\b(?:date|dt)\b/],
+  ['narr',      /\b(?:narration|description|descriptions|particulars?|details?|remarks?|memo|payee)\b/],
+  ['balance',   /\b(?:balance|bal)\b/],
+  ['debit',     /\b(?:debits?|withdrawals?|withdrawn|paid\s*out|money\s*out|dr|outflow|payments?)\b/],
+  ['credit',    /\b(?:credits?|deposits?|paid\s*in|money\s*in|cr|inflow|receipts?)\b/],
+  ['amount',    /\b(?:amount|amt)\b/],
+  ['ref',       /\b(?:chq|cheque|check|ref|reference|instrument|instr|utr|sol|branch|s\s*no|sr\s*no|serial|code|number)\b/],
+  ['type',      /^\s*(?:dr\s*\/?\s*cr|cr\s*\/?\s*dr|type|txn\s*type|transaction\s*type|d\s*\/\s*c)\s*$/],
+];
+const FRAG_RE = /^(?:\(?inr\)?|\(?rs\.?\)?|\(?₹\)?|\(?usd\)?|no\.?|number|amt\.?|amount|date|dt\.?|bal\.?|balance|dr\.?|cr\.?|\(dr\)|\(cr\)|ref\.?|chq\.?|cheque|txn|tran|trans|transaction|value|posting|description|details|particulars|narration|remarks|debit|credit|withdrawal|deposit|closing|running|opening|\/|-|in|of|\(|\))$/i;
+
+function rolesOf(text) {
+  const raw = String(text).toLowerCase();
+  const t = ' ' + raw.replace(/[^a-z0-9\/\s]/g, ' ').replace(/\s+/g, ' ').trim() + ' ';
+  const out = new Set();
+  ROLE_RES.forEach(([k, re]) => { if (re.test(k === 'type' ? t.trim() : t)) out.add(k); });
+  if (out.has('valueDate')) out.delete('date');
+  return out;
+}
+function labelRole(label) {
+  const r = rolesOf(label);
+  if (r.has('type') && !r.has('balance')) return 'type';
+  if (r.has('debit') && r.has('credit')) return 'combined';
+  if (r.has('balance')) return 'balance';
+  if (r.has('debit')) return 'debit';
+  if (r.has('credit')) return 'credit';
+  if (r.has('amount')) return 'amount';
+  if (r.has('valueDate')) return 'valueDate';
+  if (r.has('date')) return 'date';
+  if (r.has('narr')) return 'narr';
+  if (r.has('ref')) return 'ref';
+  return null;
+}
+
+const OPEN_RE   = /^\s*(?:opening\s+balance|balance\s+(?:b\/?f|brought\s+forward|c\/?f|carried\s+forward)|b\/f|c\/f|brought\s+forward|carried\s+forward|opening\s+bal|bal\s+b\/f)\b/i;
+const TOTAL_RE  = /^\s*(?:grand\s+total|sub\s*total|page\s+total|total\b|closing\s+balance|closing\s+bal\b|statement\s+summary|summary\b|balance\s+as\s+(?:on|at))/i;
+const FOOTER_RE = /\b(?:page\s*\d+\s*(?:of|\/)\s*\d+|computer[\s-]*generated|system[\s-]*generated|end\s+of\s+statement|registered\s+office|customer\s+care|toll[\s-]*free|this\s+is\s+an?\s|continued\s+(?:on|to)|www\.|nomination|please\s+(?:examine|verify)|statement\s+of\s+account|account\s+(?:name|no\b|number|statement|summary)|ifsc|micr)\b/i;
+
+// ---------------------------------------------------------------- items -> lines -> segments
+function splitOnWideSpaces(it) {
+  const s = it.str;
+  if (!/\S\s{2,}\S/.test(s)) return [{ ...it, str: s.trim() }];
+  const cw = it.w / Math.max(1, s.length), out = [];
+  const re = /\S(?:[^\s]|\s(?!\s))*/g; let m;
+  while ((m = re.exec(s))) out.push({ str: m[0], x: it.x + m.index * cw, y: it.y, w: m[0].length * cw, h: it.h });
+  return out;
+}
+
+function buildPageLines(page, pageIdx) {
+  let items = [];
+  page.items.forEach(it => splitOnWideSpaces(it).forEach(p => { if (p.str) items.push(p); }));
+  if (!items.length) return { lines: [], medH: 9 };
+  const medH = Math.max(5, median(items.map(i => i.h)));
+  const tol = Math.max(1.2, 0.3 * medH);
+  items.sort((a, b) => a.y - b.y || a.x - b.x);
+  const groups = [];
+  items.forEach(it => {
+    const g = groups[groups.length - 1];
+    if (g && Math.abs(it.y - g.y) <= tol) { g.items.push(it); g.y = (g.y * (g.items.length - 1) + it.y) / g.items.length; }
+    else groups.push({ y: it.y, items: [it] });
+  });
+  const lines = groups.map(g => {
+    g.items.sort((a, b) => a.x - b.x);
+    const h = median(g.items.map(i => i.h)) || medH;
+    // merge touching glyph fragments (char-level PDFs, split amounts "1,50,000" + ".00")
+    const merged = [];
+    g.items.forEach(it => {
+      const p = merged[merged.length - 1];
+      if (p && it.x - (p.x + p.w) <= 0.15 * h) { p.str += it.str; p.w = Math.max(p.w, it.x + it.w - p.x); }
+      else merged.push({ ...it });
+    });
+    return { y: g.y, h, page: pageIdx, segs: buildSegments(merged, h) };
+  });
+  return { lines, medH };
+}
+
+function buildSegments(tokens, h) {
+  // pass 1: dates (possibly spread over several tokens) are kept whole
+  const out = [];
+  let i = 0;
+  while (i < tokens.length) {
+    let best = null;
+    let joined = '';
+    for (let j = i; j < Math.min(tokens.length, i + 5); j++) {
+      if (j > i) {
+        const gap = tokens[j].x - (tokens[j - 1].x + tokens[j - 1].w);
+        if (gap > 1.0 * h) break;
+        joined += gap > 0.12 * h ? ' ' : '';
+      }
+      joined += tokens[j].str;
+      const m = matchDate(joined);
+      if (m && m.len === joined.length) best = { j, m };
+    }
+    if (best) {
+      const first = tokens[i], last = tokens[best.j];
+      out.push({ t: best.m.text, x0: first.x, x1: last.x + last.w, kind: 'date', date: best.m, h });
+      i = best.j + 1; continue;
+    }
+    // a single token that STARTS with a date followed by other text ("05/01/2024 UPI/..")
+    const m1 = matchDate(tokens[i].str);
+    if (m1 && m1.len < tokens[i].str.length && /^[\s:T]|^$/.test(tokens[i].str.slice(m1.len, m1.len + 1)) ) {
+      const it = tokens[i], cw = it.w / Math.max(1, it.str.length);
+      out.push({ t: m1.text, x0: it.x, x1: it.x + m1.len * cw, kind: 'date', date: m1, h });
+      let rest = it.str.slice(m1.len); const lead = rest.length - rest.trimStart().length;
+      rest = rest.trim().replace(/^\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp][Mm])?\s*/, '');
+      if (rest) tokens.splice(i + 1, 0, { str: rest, x: it.x + (m1.len + lead) * cw, y: it.y, w: rest.length * cw, h: it.h });
+      i++; continue;
+    }
+    out.push({ t: tokens[i].str, x0: tokens[i].x, x1: tokens[i].x + tokens[i].w, kind: null, h });
+    i++;
+  }
+  // pass 2: merge adjacent numeric fragments ("1,234" + ".56") and adjacent text words
+  const m2 = [];
+  const numish = s => s.kind !== 'date' && /^[\s\-+(₹$€£]*(?:rs\.?|inr)?\s*[\d][\d.,\s]*\)?\-?$/i.test(s.t);
+  out.forEach(s => {
+    const p = m2[m2.length - 1];
+    if (p && p.kind !== 'date' && s.kind !== 'date') {
+      const gap = s.x0 - p.x1;
+      const bothNum = numish(p) && numish(s) && gap <= 0.3 * h;
+      const bothText = !numish(p) && !numish(s) && gap <= 0.6 * h;
+      const suffix = numish(p) && /^[(\[]?(?:dr|cr|d|c)\.?[)\]]?$/i.test(s.t) && gap <= 1.2 * h;
+      if (bothNum || bothText || suffix) {
+        p.t = p.t + (gap > 0.12 * h && !suffix ? ' ' : (suffix ? ' ' : '')) + s.t; p.x1 = s.x1; return;
+      }
+    }
+    m2.push({ ...s });
+  });
+  m2.forEach(s => {
+    if (s.kind === 'date') return;
+    const m = parseMoney(s.t);
+    if (m) { s.kind = 'num'; s.money = m; } else s.kind = 'text';
+  });
+  return m2;
+}
+
+// ---------------------------------------------------------------- header band detection
+const CORE_ROLES = ['date', 'valueDate', 'narr', 'balance', 'debit', 'credit', 'amount'];
+function lineRoles(line) {
+  const set = new Set();
+  line.segs.forEach(s => { if (s.kind === 'date' || s.kind === 'num') return; rolesOf(s.t).forEach(r => set.add(r)); });
+  return set;
+}
+function isHeaderLine(line) {
+  if (line.segs.some(s => s.kind === 'date' || (s.kind === 'num' && isMoneyLike(s.money)))) return false;
+  const r = lineRoles(line);
+  let n = 0; CORE_ROLES.forEach(k => { if (r.has(k)) n++; });
+  return n >= 3;
+}
+function looksLikeFragmentLine(line) {
+  if (!line.segs.length) return false;
+  return line.segs.every(s => s.kind === 'text' && s.t.length <= 26 && (FRAG_RE.test(s.t.trim()) || rolesOf(s.t).size > 0 || /^\(.*\)$/.test(s.t.trim())));
+}
+// returns indices of header-band lines for one page
+function findHeaderBand(lines) {
+  let start = -1, best = -1;
+  lines.forEach((l, i) => {
+    if (!isHeaderLine(l)) return;
+    const n = lineRoles(l).size;
+    if (n > best) { best = n; start = i; }
+  });
+  if (start < 0) return null;
+  const idx = new Set([start]);
+  const stack = l => l.h * 1.9;
+  for (let i = start - 1; i >= 0; i--) {          // stacked words above ("Txn" over "Date")
+    const l = lines[i], nx = lines[i + 1];
+    if (nx.y - l.y > stack(nx) || !looksLikeFragmentLine(l)) break;
+    idx.add(i);
+  }
+  for (let i = start + 1; i < lines.length; i++) { // stacked words below ("Date", "Amount (INR)")
+    const l = lines[i], pv = lines[i - 1];
+    if (l.y - pv.y > stack(pv) || !looksLikeFragmentLine(l)) break;
+    idx.add(i);
+  }
+  const sorted = [...idx].sort((a, b) => a - b);
+  return { idx: new Set(sorted), first: sorted[0], last: sorted[sorted.length - 1] };
+}
+
+root.__SE_PART1 = { median, percentile, sum, pad2, clusterValues, bestAlignment, matchDate, parseMoney, isMoneyLike, pagesFromPdf,
+  rolesOf, labelRole, buildPageLines, isHeaderLine, findHeaderBand, OPEN_RE, TOTAL_RE, FOOTER_RE, CORE_ROLES, MONTH_IDX };
+})(typeof window !== 'undefined' ? window : globalThis);
+/* ---- part 2: column discovery, labels, numeric role search ---- */
+(function (root) {
+'use strict';
+const P1 = root.__SE_PART1;
+const { median, percentile, sum, clusterValues, bestAlignment, parseMoney, isMoneyLike, rolesOf, labelRole,
+        buildPageLines, findHeaderBand, OPEN_RE, TOTAL_RE } = P1;
+
+const TOL = 0.0105;
+const TYPE_TOKEN_RE = /^(?:dr|cr|d|c|debit|credit|dr\.|cr\.)$/i;
+
+// ---------------------------------------------------------------- arithmetic (shared)
+// entries are in DOCUMENT order: { a:amount|null, dir:'dr'|'cr'|null, b:balance|null }
+function arithCheck(entries, order, conv) {
+  conv = conv || 1;
+  let checked = 0, ok = 0; const bad = [];
+  for (let i = 1; i < entries.length; i++) {
+    const older = order === 'asc' ? entries[i - 1] : entries[i];
+    const newer = order === 'asc' ? entries[i] : entries[i - 1];
+    if (older.b == null || newer.b == null || newer.a == null) continue;
+    const delta = (newer.b - older.b) * conv;
+    checked++;
+    let good;
+    if (newer.dir) good = Math.abs(delta - (newer.dir === 'cr' ? newer.a : -newer.a)) <= TOL;
+    else good = Math.abs(Math.abs(delta) - newer.a) <= TOL;
+    if (good) ok++; else bad.push(order === 'asc' ? i : i - 1);
+  }
+  return { checked, ok, bad, score: checked ? ok / checked : 0 };
+}
+function bestArith(entries) {
+  const asc = arithCheck(entries, 'asc'), desc = arithCheck(entries, 'desc');
+  const pick = desc.ok > asc.ok ? desc : asc;
+  return { ...pick, order: desc.ok > asc.ok ? 'desc' : 'asc', asc, desc };
+}
+
+// ---------------------------------------------------------------- document analysis
+function analyzeLayout(pages, opts) {
+  const doc = { pages: [], warnings: [] };
+  pages.forEach((pg, pi) => {
+    const { lines, medH } = buildPageLines(pg, pi);
+    const band = findHeaderBand(lines);
+    lines.forEach((l, i) => { l.isHdr = !!(band && band.idx.has(i)); l.idx = i; });
+    doc.pages.push({ lines, band, medH, width: pg.width, height: pg.height });
+  });
+  const bodyLines = [];
+  doc.pages.forEach(pg => pg.lines.forEach(l => { if (!l.isHdr) bodyLines.push(l); }));
+  if (!bodyLines.length) return { fail: 'no-text' };
+
+  // ---- 1. date columns
+  const dateSegs = [];
+  bodyLines.forEach(l => l.segs.forEach(s => { if (s.kind === 'date') dateSegs.push(s); }));
+  if (dateSegs.length < 1) return { fail: 'no-dates' };
+  const tiny = dateSegs.length < 3; // 1-2 transaction statements: relax minimum-support thresholds
+  const dba = bestAlignment(dateSegs, 3.5);
+  const maxN = Math.max(...dba.clusters.map(c => c.n));
+  const dcols = dba.clusters.filter(c => c.n >= Math.max(tiny ? 1 : 2, 0.25 * maxN)).map(c => ({
+    kind: 'date', n: c.n, L: Math.min(...c.items.map(e => e.s.x0)) - 1.5, R: Math.max(...c.items.map(e => e.s.x1)) + 1.5,
+  })).sort((a, b) => a.L - b.L);
+  if (!dcols.length) return { fail: 'no-date-column' };
+
+  // ---- header segments (best band across pages)
+  let hdrSegs = [], bestBandRoles = -1;
+  doc.pages.forEach(pg => {
+    if (!pg.band) return;
+    const segs = [];
+    [...pg.band.idx].sort((a, b) => a - b).forEach(i => pg.lines[i].segs.forEach(s => segs.push({ ...s, ly: pg.lines[i].y })));
+    const n = new Set(segs.flatMap(s => [...rolesOf(s.t)])).size;
+    if (n > bestBandRoles) { bestBandRoles = n; hdrSegs = segs; }
+  });
+
+  // ---- 2. numeric (money) columns
+  const dateLeft = dcols[0].L;
+  const moneySegs = [];
+  bodyLines.forEach(l => l.segs.forEach(s => { if (s.kind === 'num' && isMoneyLike(s.money) && s.x0 > dateLeft) moneySegs.push(s); }));
+  if (!moneySegs.length && !hdrSegs.length) return { fail: 'no-amounts' };
+
+  // choose tx-date column provisional (for thresholds): the one with most members, leftmost on ties
+  const nTx = Math.max(...dcols.map(c => c.n));
+  const thr = Math.max(tiny ? 1 : 2, Math.round(0.12 * nTx));
+  let ncols = [];
+  if (moneySegs.length) {
+    const nba = bestAlignment(moneySegs, 3.5);
+    ncols = nba.clusters.filter(c => c.n >= thr).map(c => ({
+      kind: 'num', n: c.n, L: Math.min(...c.items.map(e => e.s.x0)) - 1.5, R: Math.max(...c.items.map(e => e.s.x1)) + 1.5, al: nba.al,
+    }));
+    // header-anchored sparse columns (e.g. a Credit column with only a couple of entries)
+    hdrSegs.forEach(h => {
+      const role = labelRole(h.t);
+      if (!['debit', 'credit', 'balance', 'amount', 'combined'].includes(role)) return;
+      const cx0 = h.x0 - 12, cx1 = h.x1 + 12;
+      if (ncols.some(c => c.R >= h.x0 - 2 && c.L <= h.x1 + 2)) return;
+      const near = moneySegs.filter(s => { const c = (s.x0 + s.x1) / 2; return c >= cx0 && c <= cx1; });
+      if (near.length) ncols.push({ kind: 'num', n: near.length, L: Math.min(...near.map(s => s.x0)) - 1.5, R: Math.max(...near.map(s => s.x1)) + 1.5, al: nba.al });
+    });
+    ncols.sort((a, b) => a.L - b.L);
+    // merge numeric columns that overlap in x (rare: ragged alignment)
+    for (let i = ncols.length - 2; i >= 0; i--) if (ncols[i].R > ncols[i + 1].L) { const a = ncols[i], b = ncols[i + 1]; a.R = Math.max(a.R, b.R); a.L = Math.min(a.L, b.L); a.n += b.n; ncols.splice(i + 1, 1); }
+  }
+  if (!ncols.length) return { fail: 'no-amount-columns' };
+
+  const overlaps = (s, c) => Math.min(s.x1, c.R) - Math.max(s.x0, c.L);
+  const inKnown = s => dcols.some(c => overlaps(s, c) > 0 && s.kind === 'date') || ncols.some(c => overlaps(s, c) > 0 && s.kind === 'num' && isMoneyLike(s.money));
+
+  // ---- 3. table region + text columns by horizontal projection
+  const regionLines = [];
+  doc.pages.forEach(pg => {
+    const tx = [];
+    pg.lines.forEach((l, i) => {
+      if (l.isHdr) return;
+      const hasDate = l.segs.some(s => s.kind === 'date' && dcols.some(c => overlaps(s, c) > 0));
+      const hasMoney = l.segs.some(s => s.kind === 'num' && isMoneyLike(s.money) && ncols.some(c => overlaps(s, c) > 0));
+      if (hasDate || hasMoney) tx.push(i);
+    });
+    if (!tx.length) return;
+    let first = tx.find(i => pg.lines[i].segs.some(s => s.kind === 'date' && dcols.some(c => overlaps(s, c) > 0)));
+    if (first === undefined) first = tx[0];
+    for (let i = first; i <= tx[tx.length - 1]; i++) if (!pg.lines[i].isHdr) regionLines.push(pg.lines[i]);
+  });
+  const nTxLines = regionLines.filter(l => l.segs.some(s => s.kind === 'date' && dcols.some(c => overlaps(s, c) > 0))).length || nTx;
+  const textSegs = [];
+  regionLines.forEach(l => l.segs.forEach(s => { if (!inKnown(s)) textSegs.push(s); }));
+  const h0 = median(bodyLines.map(l => l.h)) || 9;
+  const comps = [];
+  {
+    // coverage profile: how many text segments cover each x. Text that only a few lines have (preamble, footer,
+    // summary blocks) must not bridge two real columns together, so runs need support from the transaction rows.
+    const sup = Math.max(tiny ? 1 : 2, Math.round(0.08 * nTxLines));
+    const evs = [];
+    textSegs.forEach(s => { evs.push([s.x0, 1], [s.x1, -1]); });
+    evs.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const runs = []; let cov = 0, start = null;
+    evs.forEach(([x, d]) => {
+      const was = cov >= sup; cov += d; const is = cov >= sup;
+      if (!was && is) start = x;
+      else if (was && !is) runs.push({ L: start, R: x });
+    });
+    const merged = [];
+    runs.forEach(r => { const m = merged[merged.length - 1]; if (m && r.L - m.R <= 0.6 * h0) m.R = r.R; else merged.push({ ...r }); });
+    merged.forEach(r => {
+      const segs = textSegs.filter(s => (s.x0 + s.x1) / 2 >= r.L - 0.3 && (s.x0 + s.x1) / 2 <= r.R + 0.3);
+      if (!segs.length) return;
+      comps.push({ kind: 'text', L: Math.min(...segs.map(s => s.x0)), R: Math.max(...segs.map(s => s.x1)), segs });
+    });
+  }
+  comps.forEach(c => { c.n = c.segs.length; c.chars = sum(c.segs.map(s => s.t.length)); });
+  // drop negligible components (page-header leftovers / stray tokens)
+  const tcols = comps.filter(c => c.n >= Math.max(tiny ? 1 : 3, Math.round(0.15 * nTxLines))).sort((a, b) => a.L - b.L);
+
+  // type column (Dr/Cr word column)
+  tcols.forEach(c => { c.isType = c.segs.filter(s => TYPE_TOKEN_RE.test(s.t.trim())).length / c.n >= 0.7; });
+
+  // ---- 4. labels from header band
+  const allCols = [...dcols, ...ncols, ...tcols];
+  allCols.forEach(c => { c.labelParts = []; });
+  hdrSegs.forEach(h => {
+    let best = null, bo = 0;
+    allCols.forEach(c => { const o = Math.min(h.x1, c.R + 4) - Math.max(h.x0, c.L - 4); if (o > bo) { bo = o; best = c; } });
+    if (!best) {
+      let bd = 14; allCols.forEach(c => { const d = Math.abs((h.x0 + h.x1) / 2 - (c.L + c.R) / 2); if (d < bd) { bd = d; best = c; } });
+    }
+    if (best) best.labelParts.push(h);
+  });
+  allCols.forEach(c => {
+    c.labelParts.sort((a, b) => a.ly - b.ly || a.x0 - b.x0);
+    c.label = c.labelParts.map(p => p.t).join(' ').trim();
+    c.lrole = c.label ? labelRole(c.label) : null;
+  });
+
+  // ---- 5. choose tx-date column, narration column, aux columns
+  let txDate = dcols.find(c => c.lrole === 'date') || dcols.filter(c => c.lrole !== 'valueDate')[0] || dcols[0];
+  const vdates = dcols.filter(c => c !== txDate);
+  let narr = tcols.filter(c => !c.isType && c.lrole === 'narr').sort((a, b) => b.chars - a.chars)[0]
+          || tcols.filter(c => !c.isType).sort((a, b) => b.chars - a.chars)[0] || null;
+  const typeCol = tcols.find(c => c.isType) || null;
+  const aux = tcols.filter(c => c !== narr && c !== typeCol);
+
+  // narration extents: widen to the neighbouring columns (so wrapped / ragged text is still captured)
+  const others = [...dcols, ...ncols, ...aux, ...(typeCol ? [typeCol] : [])];
+  if (narr) {
+    const right = others.filter(c => c.L > narr.L + 4).map(c => c.L);
+    const left = others.filter(c => c.R < narr.R - 4 && c.R <= narr.L + 2).map(c => c.R);
+    narr.xL = Math.max(left.length ? Math.max(...left) + 1 : -1e9, narr.L - 8);
+    narr.xR = right.length ? Math.min(...right) - 1.5 : Math.max(narr.R + 4, doc.pages[0].width);
+    if (narr.xR < narr.R) narr.xR = narr.R + 1;
+  } else {
+    // no usable text column: whatever sits between the date column and the first money column
+    const lo = txDate.R, hi = ncols[0].L;
+    narr = { kind: 'text', L: lo, R: hi, xL: lo + 1, xR: hi - 1.5, n: 0, chars: 0, label: '', synthetic: true };
+  }
+
+  return { doc, bodyLines, dcols, txDate, vdates, ncols, narr, aux, typeCol, hdrSegs, nTxLines, h0 };
+}
+
+// ---------------------------------------------------------------- segment -> column assignment
+function makeAssigner(L) {
+  const cols = [];
+  cols.push({ role: 'date', c: L.txDate, L: L.txDate.L, R: L.txDate.R });
+  L.vdates.forEach(c => cols.push({ role: 'vdate', c, L: c.L, R: c.R }));
+  cols.push({ role: 'narr', c: L.narr, L: L.narr.xL, R: L.narr.xR });
+  L.aux.forEach(c => cols.push({ role: 'aux', c, L: c.L - 1, R: c.R + 1 }));
+  if (L.typeCol) cols.push({ role: 'type', c: L.typeCol, L: L.typeCol.L - 1, R: L.typeCol.R + 1 });
+  L.ncols.forEach((c, i) => cols.push({ role: 'num', c, i, L: c.L, R: c.R }));
+  return function assign(s) {
+    let best = null, bo = 0;
+    for (const k of cols) {
+      const o = Math.min(s.x1, k.R) - Math.max(s.x0, k.L);
+      if (o > bo + 1e-9) { bo = o; best = k; }
+    }
+    if (best) return best;
+    // between columns: nearest by centre within a small distance
+    const cx = (s.x0 + s.x1) / 2; let bd = 7;
+    for (const k of cols) { const d = cx < k.L ? k.L - cx : (cx > k.R ? cx - k.R : 0); if (d < bd) { bd = d; best = k; } }
+    return best;
+  };
+}
+
+// ---------------------------------------------------------------- numeric role search
+function subsetsOf(n, maxSize) {
+  const out = [];
+  const rec = (start, cur) => { if (cur.length) out.push([...cur]); if (cur.length === maxSize) return; for (let i = start; i < n; i++) { cur.push(i); rec(i + 1, cur); cur.pop(); } };
+  rec(0, []);
+  return out;
+}
+const PATTERNS = {
+  1: [['amount']],
+  2: [['amount', 'balance'], ['balance', 'amount'], ['debit', 'credit'], ['credit', 'debit']],
+  3: [['debit', 'credit', 'balance'], ['credit', 'debit', 'balance'], ['balance', 'debit', 'credit'], ['balance', 'credit', 'debit']],
+};
+
+function roleCandidates(L, assign) {
+  const m = L.ncols.length;
+  // tokens per numeric line (one token per column per line)
+  const lines = [];
+  L.bodyLines.forEach(l => {
+    const toks = new Array(m).fill(null); let any = false;
+    l.segs.forEach(s => {
+      if (s.kind !== 'num') return;
+      const k = assign(s);
+      if (k && k.role === 'num' && s.money) { const prev = toks[k.i]; if (!prev || s.x1 > prev.x1) toks[k.i] = s; any = true; }
+    });
+    if (any) lines.push({ toks, line: l });
+  });
+  const ordered = L.ncols.map((c, i) => ({ i, n: lines.filter(x => x.toks[i]).length })).sort((a, b) => b.n - a.n).slice(0, 6).map(x => x.i).sort((a, b) => a - b);
+  const totalTok = sum(lines.map(x => x.toks.filter(Boolean).length)) || 1;
+  const cands = [];
+  subsetsOf(ordered.length, 3).forEach(sub => {
+    const idxs = sub.map(k => ordered[k]);
+    (PATTERNS[idxs.length] || []).forEach(pat => {
+      const roles = {}; idxs.forEach((ci, k) => { roles[pat[k]] = ci; });
+      const entries = []; let usedTok = 0, bothFilled = 0, exclusive = 0, ampLines = 0, balLines = 0;
+      lines.forEach(({ toks }) => {
+        let a = null, dir = null, b = null, nz = 0;
+        const get = role => { const s = toks[roles[role]]; return s ? s.money : null; };
+        if (roles.balance !== undefined) { const mb = get('balance'); if (mb) { b = mb.value * (mb.dir === 'dr' ? -1 : (mb.sign < 0 ? -1 : 1)); usedTok++; balLines++; } }
+        if (roles.debit !== undefined || roles.credit !== undefined) {
+          const d = get('debit'), c = get('credit');
+          const dv = d && d.value > 0 ? d : null, cv = c && c.value > 0 ? c : null;
+          if (d) usedTok++; if (c) usedTok++;
+          if (dv && cv) bothFilled++; else if (dv || cv) exclusive++;
+          if (dv && !cv) { a = dv.value; dir = 'dr'; } else if (cv && !dv) { a = cv.value; dir = 'cr'; }
+        } else if (roles.amount !== undefined) {
+          const am = get('amount');
+          if (am) { usedTok++; a = am.value; dir = am.dir || (am.sign < 0 ? 'dr' : null); }
+        }
+        if (a != null) ampLines++;
+        entries.push({ a, dir, b });
+      });
+      if (!entries.length) return;
+      const ar = bestArith(entries);
+      const coverage = ampLines / Math.max(1, lines.length);
+      let score = (ar.checked >= 3 ? ar.score : 0.45) * (0.4 + 0.6 * coverage);
+      const hasDC = roles.debit !== undefined && roles.credit !== undefined;
+      if (hasDC) { const f = exclusive / Math.max(1, exclusive + bothFilled); score += 0.2 * f - 0.3 * (1 - f); }
+      score -= 0.35 * (1 - usedTok / totalTok);
+      // header labels
+      Object.keys(roles).forEach(role => {
+        const lr = L.ncols[roles[role]].lrole;
+        if (!lr) return;
+        if (lr === role || (lr === 'combined' && role === 'amount')) score += 0.12;
+        else if (['debit', 'credit', 'balance', 'amount', 'combined'].includes(lr)) score -= 0.2;
+      });
+      if (roles.balance !== undefined && roles.balance === Math.max(...idxs)) score += 0.04;
+      cands.push({ roles, score, arith: ar, coverage, idxs });
+    });
+  });
+  cands.sort((a, b) => b.score - a.score);
+  return { cands, lines };
+}
+
+root.__SE_PART2 = { arithCheck, bestArith, analyzeLayout, makeAssigner, roleCandidates, TOL };
+})(typeof window !== 'undefined' ? window : globalThis);
+/* ---- part 3: row assembly, direction / order resolution, date normalisation ---- */
+(function (root) {
+'use strict';
+const P1 = root.__SE_PART1, P2 = root.__SE_PART2;
+const { median, percentile, sum, pad2, matchDate, MONTH_IDX, OPEN_RE, TOTAL_RE, FOOTER_RE } = P1;
+const { arithCheck, bestArith, analyzeLayout, makeAssigner, roleCandidates, TOL } = P2;
+
+const joinSegs = (segs, h) => {
+  let out = '', prev = null;
+  segs.forEach(s => { if (prev && s.x0 - prev.x1 > 0.12 * h) out += ' '; out += s.t; prev = s; });
+  return out;
+};
+
+// ---------------------------------------------------------------- line classification
+function classifyLines(L, assign, roles) {
+  const m = L.ncols.length;
+  const lines = [];
+  L.doc.pages.forEach((pg, pi) => {
+    pg.lines.forEach(l => {
+      if (l.isHdr) { lines.push({ src: l, page: pi, kind: 'hdr', y: l.y, h: l.h }); return; }
+      const cells = { date: null, narr: [], type: [], nums: new Array(m).fill(null) };
+      l.segs.forEach(s => {
+        const k = assign(s); if (!k) return;
+        if (k.role === 'date') { if (s.kind === 'date' && !cells.date) cells.date = s; }
+        else if (k.role === 'narr') cells.narr.push(s);
+        else if (k.role === 'type') cells.type.push(s);
+        else if (k.role === 'num') { if (s.kind === 'num') { const p = cells.nums[k.i]; if (!p || s.x1 > p.x1) cells.nums[k.i] = s; } }
+      });
+      const tok = r => (roles[r] !== undefined && cells.nums[roles[r]]) ? cells.nums[roles[r]] : null;
+      const o = { src: l, page: pi, y: l.y, h: l.h, cells, narrSegs: cells.narr.sort((a, b) => a.x0 - b.x0),
+        deb: tok('debit'), cre: tok('credit'), amt: tok('amount'), bal: tok('balance') };
+      o.narrText = joinSegs(o.narrSegs, l.h);
+      o.hasDate = !!cells.date;
+      o.hasAmt = !!(o.deb || o.cre || o.amt);
+      o.hasBal = !!o.bal;
+      o.allText = l.segs.map(s => s.t).join(' ');
+      let kind;
+      if (o.hasDate && !o.hasAmt && o.hasBal && OPEN_RE.test(o.narrText)) kind = 'open';
+      else if (!o.hasDate && !o.hasAmt && o.hasBal && OPEN_RE.test(o.narrText)) kind = 'open';
+      else if (o.hasAmt && (TOTAL_RE.test(o.narrText) || OPEN_RE.test(o.narrText))) kind = 'junk';
+      else if (!o.hasDate && !o.hasAmt && TOTAL_RE.test(o.narrText)) kind = 'junk';
+      else if (o.hasAmt) kind = 'P';
+      else if (o.hasDate && o.hasBal) kind = 'junk';
+      else if (o.hasDate) kind = 'D';
+      else if (o.hasBal) kind = 'B';
+      else if (o.narrSegs.length) kind = 'N';
+      else kind = 'E';
+      o.kind = kind;
+      lines.push(o);
+    });
+  });
+  return lines;
+}
+
+// ---------------------------------------------------------------- pairing of date-only lines with amount lines
+function pairDates(lines) {
+  const body = lines.filter(l => l.kind !== 'hdr');
+  const nD = body.filter(l => l.kind === 'D').length;
+  const firstEv = body.find(l => l.kind === 'D' || (l.kind === 'P' && !l.hasDate));
+  const after = !!(nD > 0 && firstEv && firstEv.kind === 'P');
+  const seq = after ? [...body].reverse() : body;
+  let pending = null, carry = null;
+  seq.forEach(l => {
+    if (l.kind === 'D') { pending = l; return; }
+    if (l.kind === 'junk' || l.kind === 'open') return;
+    if (l.kind !== 'P') return;
+    if (l.hasDate) { carry = l.cells.date; pending = null; return; }
+    if (pending && pending.page === l.page) { l.pairD = pending; l.dateSeg = pending.cells.date; carry = pending.cells.date; pending = null; }
+    else if (carry) { l.dateSeg = carry; l.carried = true; }
+  });
+  return { after };
+}
+
+// ---------------------------------------------------------------- block building
+function buildBlocks(lines, L) {
+  const byPage = new Map();
+  lines.forEach(l => { if (!byPage.has(l.page)) byPage.set(l.page, []); if (l.kind !== 'hdr') byPage.get(l.page).push(l); });
+  const gapsAll = [];
+  byPage.forEach(pl => { for (let i = 1; i < pl.length; i++) { const g = pl[i].y - pl[i - 1].y; if (g > 0.5 * pl[i].h) gapsAll.push(g); } });
+  const h0 = median(lines.filter(l => l.kind !== 'hdr').map(l => l.h)) || 9;
+  const pitch = Math.max(0.9 * h0, percentile(gapsAll, 0.1) || h0 * 1.2);
+  const tight = pitch * 1.45;
+  const colL = L.narr.L;
+
+  // cores
+  const pages = [];
+  byPage.forEach((pl, pi) => {
+    pl.forEach((l, i) => { l.pos = i; });
+    const cores = [];
+    pl.forEach(l => {
+      if (l.kind === 'P') cores.push({ P: l, first: l.pairD ? Math.min(l.pos, l.pairD.pos) : l.pos, last: l.pairD ? Math.max(l.pos, l.pairD.pos) : l.pos, lines: [] });
+      else if (l.kind === 'open') cores.push({ open: l, first: l.pos, last: l.pos, lines: [] });
+    });
+    cores.sort((a, b) => a.first - b.first);
+    // overlapping cores (should not happen) -> shrink
+    for (let i = 1; i < cores.length; i++) if (cores[i].first <= cores[i - 1].last) cores[i].first = cores[i - 1].last + 1;
+    pages.push({ pl, cores });
+  });
+
+  // vote for the alignment mode from runs with clear gap evidence
+  const votes = { post: 0, pre: 0, mid: 0 };
+  const evalRun = (prevY, orphans, nextY) => {
+    const ys = [prevY, ...orphans.map(o => o.y), nextY];
+    const gaps = []; for (let i = 1; i < ys.length; i++) gaps.push(ys[i] - ys[i - 1]);
+    const srt = [...gaps].sort((a, b) => b - a);
+    const g1 = srt[0], g2 = srt[1] || 0;
+    if (orphans.length && g1 >= 1.2 * g2 && g1 > 1.05 * (srt[srt.length - 1])) return { s: gaps.indexOf(g1), clear: true };
+    return { s: null, clear: false };
+  };
+  const walkRuns = (cb) => {
+    pages.forEach(pg => {
+      const { pl, cores } = pg;
+      const inCore = new Map(); cores.forEach((c, ci) => { for (let p = c.first; p <= c.last; p++) inCore.set(p, ci); });
+      let pend = [], prev = null;
+      for (let p = 0; p < pl.length; p++) {
+        const l = pl[p];
+        if (inCore.has(p)) { const c = cores[inCore.get(p)]; if (c.first === p) { cb(prev, pend, c, pg); pend = []; prev = c; } p = Math.max(p, c.last); continue; }
+        if (l.kind === 'junk') { cb(prev, pend, null, pg); pend = []; prev = null; continue; }
+        pend.push(l);
+      }
+      cb(prev, pend, null, pg);
+    });
+  };
+  let interiorRuns = 0;
+  walkRuns((prev, orphans, next, pg) => {
+    if (prev && next && orphans.length) {
+      interiorRuns++;
+      const r = evalRun(pg.pl[prev.last].y, orphans, pg.pl[next.first].y);
+      if (r.clear) { if (r.s === orphans.length) votes.post++; else if (r.s === 0) votes.pre++; else votes.mid++; }
+    }
+  });
+  // a wrapped line belongs to the narration cell if it starts at the column's left edge (left-aligned text) or sits
+  // wholly inside the narration column (centred / right-aligned cells, e.g. RBL)
+  const aligned = l => l.narrSegs.length && (Math.abs(l.narrSegs[0].x0 - colL) <= 8 ||
+    (l.narrSegs[0].x0 >= L.narr.xL - 2 && l.narrSegs[l.narrSegs.length - 1].x1 <= L.narr.xR + 2));
+  const edgeVotes = { post: 0, pre: 0 };
+  walkRuns((prev, orphans, next, pg) => {
+    const real = o => aligned(o) && !FOOTER_RE.test(o.allText);
+    if (!prev && next && orphans.length) { const o = orphans[orphans.length - 1]; if (pg.pl[next.first].y - o.y <= tight && real(o)) edgeVotes.pre++; }
+    if (prev && !next && orphans.length) { const o = orphans[0]; if (o.y - pg.pl[prev.last].y <= tight && real(o)) edgeVotes.post++; }
+  });
+  const interiorClear = votes.post + votes.pre + votes.mid;
+  let mode = 'post';
+  if (interiorClear > 0) {
+    if (votes.pre > votes.post && votes.pre >= votes.mid) mode = 'pre';
+    else if (votes.mid > votes.post && votes.mid > votes.pre) mode = 'mid';
+  } else if (edgeVotes.pre > edgeVotes.post) mode = 'pre';
+  votes.edgePre = edgeVotes.pre; votes.edgePost = edgeVotes.post;
+  let ambiguousRuns = 0;
+  const attach = (core, ls) => { ls.forEach(x => core.lines.push(x)); };
+  walkRuns((prev, orphans, next, pg) => {
+    if (!orphans.length) return;
+    const pl = pg.pl;
+    if (prev && next) {
+      const r = evalRun(pl[prev.last].y, orphans, pl[next.first].y);
+      let s;
+      if (r.clear) s = r.s;
+      else { ambiguousRuns++; s = mode === 'post' ? orphans.length : (mode === 'pre' ? 0 : Math.ceil(orphans.length / 2)); }
+      attach(prev, orphans.slice(0, s)); attach(next, orphans.slice(s));
+      if (!r.clear && orphans.some(o => o.narrSegs.length)) { prev.ambiguous = next.ambiguous = true; }
+    } else if (prev && !next) {
+      if (interiorRuns === 0 || mode === 'pre') return;
+      let y0 = pl[prev.last].y; const take = [];
+      for (const o of orphans) { if (o.y - y0 > tight || !aligned(o) || FOOTER_RE.test(o.allText)) break; take.push(o); y0 = o.y; }
+      attach(prev, take);
+    } else if (!prev && next) {
+      if (interiorRuns === 0 || mode === 'post') return;
+      let y0 = pl[next.first].y; const take = [];
+      for (let i = orphans.length - 1; i >= 0; i--) { const o = orphans[i]; if (y0 - o.y > tight || !aligned(o) || FOOTER_RE.test(o.allText)) break; take.unshift(o); y0 = o.y; }
+      attach(next, take);
+    }
+  });
+  return { pages, mode, votes, pitch, tight, ambiguousRuns };
+}
+
+// ---------------------------------------------------------------- narration text
+// A wrapped cell either breaks at a space (a space belongs between the lines) or is forced to break
+// in the middle of a token because the next character did not fit (NO space belongs). The previous
+// line's right edge tells them apart: if the next character would still have fitted, it was a real
+// word break; if there was less room than one character, the break was forced.
+const NARROW_CH = /[il1I.,:;|!'()\[\]\/tfjr]/, WIDE_CH = /[WMmw@%]/;
+const charFactor = ch => NARROW_CH.test(ch) ? 0.62 : (WIDE_CH.test(ch) ? 1.45 : 1);
+function narrationParts(blockLines) {
+  const parts = [];
+  blockLines.forEach(l => {
+    const t = l.narrText.trim();
+    if (!t) return;
+    const x0 = l.narrSegs[0].x0, x1 = l.narrSegs[l.narrSegs.length - 1].x1;
+    parts.push({ t, x0, x1, cw: Math.max(1, (x1 - x0) / Math.max(1, t.length)) });
+  });
+  return parts;
+}
+const forcedBreak = (prev, cur, edge, k) => (edge - prev.x1) < cur.cw * charFactor(cur.t[0]) * (k || 1) + 0.4;
+function wrapStyle(allParts, edge) {
+  let n = 0, f = 0;
+  allParts.forEach(parts => { for (let i = 1; i < parts.length; i++) { n++; if (forcedBreak(parts[i - 1], parts[i], edge)) f++; } });
+  return { n, f, style: (n >= 4 && f / n >= 0.75) ? 'char' : 'word' };
+}
+function joinNarration(parts, edge, style) {
+  let out = '';
+  parts.forEach((p, i) => {
+    if (!out) { out = p.t; return; }
+    const lastTok = out.split(/\s+/).pop();
+    const noSpace = style === 'char' ? forcedBreak(parts[i - 1], p, edge, 1.4)
+      : (lastTok.length >= 12 && forcedBreak(parts[i - 1], p, edge));
+    out += (noSpace ? '' : ' ') + p.t;
+  });
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+// ---------------------------------------------------------------- dates
+function resolveDates(rows, hint) {
+  const info = { format: 'unknown', conflict: false };
+  const nums = rows.filter(r => r.dateSeg && r.dateSeg.date.kind === 'num');
+  let interp = hint === 'MDY' ? 'mdy' : 'dmy';
+  if (nums.length) {
+    let ev = { dmy: 0, mdy: 0 };
+    nums.forEach(r => { const g = r.dateSeg.date.g; if (+g[0] > 12) ev.dmy++; if (+g[1] > 12) ev.mdy++; });
+    if (ev.dmy && !ev.mdy) { interp = 'dmy'; info.format = 'DD/MM'; }
+    else if (ev.mdy && !ev.dmy) { interp = 'mdy'; info.format = 'MM/DD'; }
+    else if (ev.dmy && ev.mdy) { interp = ev.dmy >= ev.mdy ? 'dmy' : 'mdy'; info.conflict = true; }
+    else {
+      const seqScore = it => {
+        const v = rows.map(r => ymd(r, it)).filter(Boolean).map(x => x.y * 10000 + x.m * 100 + x.d);
+        let up = 0, dn = 0; for (let i = 1; i < v.length; i++) { if (v[i] >= v[i - 1]) up++; if (v[i] <= v[i - 1]) dn++; }
+        return Math.max(up, dn) / Math.max(1, v.length - 1);
+      };
+      const sd = seqScore('dmy'), sm = seqScore('mdy');
+      if (sd > sm + 0.05) { interp = 'dmy'; info.format = 'DD/MM'; }
+      else if (sm > sd + 0.05) { interp = 'mdy'; info.format = 'MM/DD'; }
+      else info.format = hint === 'MDY' ? 'MM/DD (from setting)' : 'DD/MM (assumed)';
+    }
+  } else info.format = 'text/ISO';
+  rows.forEach(r => { r.ymd = r.dateSeg ? ymd(r, interp) : null; });
+  return info;
+  function ymd(r, it) {
+    if (!r.dateSeg) return null;
+    const d = r.dateSeg.date, g = d.g;
+    let y, m, dd;
+    if (d.kind === 'ymd') { y = +g[0]; m = +g[1]; dd = +g[2]; }
+    else if (d.kind === 'dmon') { dd = +g[0]; m = MONTH_IDX[g[1].slice(0, 3).toLowerCase()]; y = +g[2]; }
+    else if (d.kind === 'mond') { m = MONTH_IDX[g[0].slice(0, 3).toLowerCase()]; dd = +g[1]; y = +g[2]; }
+    else { if (it === 'mdy') { m = +g[0]; dd = +g[1]; } else { dd = +g[0]; m = +g[1]; } y = +g[2]; }
+    if (y < 100) y += 2000;
+    if (!(m >= 1 && m <= 12 && dd >= 1 && dd <= 31 && y >= 1990 && y <= 2100)) return null;
+    return { y, m, d: dd };
   }
 }
+
+// ---------------------------------------------------------------- one full pass with a given role assignment
+function runConfig(L, assign, cand, opts) {
+  const roles = cand.roles;
+  const lines = classifyLines(L, assign, roles);
+  const pairInfo = pairDates(lines);
+  const blk = buildBlocks(lines, L);
+  const narrRight = percentile(lines.filter(l => l.narrSegs && l.narrSegs.length).map(l => l.narrSegs[l.narrSegs.length - 1].x1), 0.97) || L.narr.xR;
+
+  // rows in document order
+  const rows = [];
+  const partsAll = [];
+  let dropped = 0, seenDated = false;
+  blk.pages.forEach(pg => pg.cores.forEach(c => {
+    if (c.open) { rows.push({ kind: 'open', page: c.open.page, y: c.open.y, bal: c.open.bal ? c.open.bal.money : null, dateSeg: c.open.cells.date }); return; }
+    const P = c.P;
+    const ls = [...new Set([...(P.pairD ? [P.pairD] : []), P, ...c.lines])].sort((a, b) => a.pos - b.pos);
+    // interior lines between a paired date line and the amount line are part of the block
+    for (let p = c.first; p <= c.last; p++) { const x = pg.pl[p]; if (x && !ls.includes(x) && x.kind !== 'junk' && x.kind !== 'open') ls.push(x); }
+    ls.sort((a, b) => a.pos - b.pos);
+    // balance / amount tokens: prefer the amount line, fall back to any line of the block
+    const pick = key => { if (P[key]) return P[key]; for (const x of ls) if (x[key]) return x[key]; return null; };
+    const row = {
+      kind: 'tx', page: P.page, y: P.y, dateSeg: P.cells.date || P.dateSeg || null, carried: !!P.carried,
+      _parts: narrationParts(ls),
+      deb: pick('deb'), cre: pick('cre'), amt: pick('amt'), bal: pick('bal'),
+      typeText: ls.flatMap(x => x.cells ? x.cells.type : []).map(s => s.t).join(' ').trim(),
+      ambiguous: !!c.ambiguous, warns: [],
+    };
+    // not a transaction: nothing to post (no amount and no balance), or page-header / account-details text
+    // that only looks numeric (phone numbers, limits) and sits above the first dated row
+    const nz = x => x && x.money && x.money.value > 0;
+    if (!(nz(row.deb) || nz(row.cre) || nz(row.amt) || row.bal) || (!seenDated && !row.dateSeg)) { dropped++; return; }
+    if (row.dateSeg) seenDated = true;
+    rows.push(row);
+    partsAll.push(row._parts);
+  }));
+  const edge = percentile(partsAll.flat().map(p => p.x1), 0.95) || narrRight;   // right edge of the narration cell, from real rows only
+  const ws = wrapStyle(partsAll, edge);
+  rows.forEach(r => { if (r.kind === 'tx') { r.narration = joinNarration(r._parts, edge, ws.style); if (!opts.debug) delete r._parts; } });
+  blk.wrap = ws;
+  return { rows, blk, pairInfo, roles, dropped };
+}
+
+// ---------------------------------------------------------------- opening balance printed in the statement header
+function findOpeningBalance(L) {
+  const re = /(?:opening\s+bal(?:ance)?|balance\s+(?:b\/?f|brought\s+forward)|b\/f)/i;
+  const pg = L.doc.pages[0];
+  for (const l of pg.lines) {
+    if (l.isHdr) continue;
+    if (l.segs.some(s => s.kind === 'date' && s.x0 < L.txDate.R + 2 && s.x1 > L.txDate.L - 2)) break;   // reached the table
+    const text = l.segs.map(s => s.t).join(' ');
+    const m = text.match(re); if (!m) continue;
+    const rest = text.slice(m.index + m[0].length).split(/\s+/).filter(Boolean);
+    for (let i = 0; i < rest.length; i++) {
+      const tk = rest[i].replace(/[:;,]+$/, ''); if (!tk) continue;
+      const dm = matchDate(tk); if (dm && dm.len === tk.length) continue;
+      const nxt = rest[i + 1] && /^(?:dr|cr)\.?$/i.test(rest[i + 1]) ? ' ' + rest[i + 1] : '';
+      const mo = P1.parseMoney(tk + nxt);
+      if (mo && P1.isMoneyLike(mo)) return mo.value * ((mo.dir === 'dr' || mo.sign < 0) ? -1 : 1);
+    }
+  }
+  return null;
+}
+const CR_HINT = /\b(?:by\s+(?:transfer|clearing|cash|cheque|chq)|upi\/cr|neft\s*cr|imps\s*cr|credit(?:ed)?|deposit|salary|interest|int\.?\s*pd|refund|reversal|received)\b|(?:^|[^a-z])cr(?:[^a-z]|$)/i;
+const DR_HINT = /\b(?:to\s+(?:transfer|clearing)|upi\/dr|atm|wdl|withdrawal|pos|debit(?:ed)?|charges?|fees?|paid|purchase|emi|bill\s*pay)\b|(?:^|[^a-z])dr(?:[^a-z]|$)/i;
+
+// ---------------------------------------------------------------- finalize rows: amounts, direction, order, flags
+function finalizeRows(rows, roles, opts) {
+  const warnings = [];
+  const dateInfo = resolveDates(rows, opts.dateHint);
+  if (dateInfo.conflict) warnings.push('Dates mix DD/MM and MM/DD patterns - check dates.');
+  const hasNeg = rows.some(r => r.kind === 'tx' && r.amt && r.amt.money.sign === -1);
+  // Statements that mark only one side ("... Cr" on credits, nothing on debits) imply the unmarked side.
+  let markedCr = 0, markedDr = 0;
+  rows.forEach(r => { if (r.kind === 'tx' && r.amt && r.amt.money.dir) { if (r.amt.money.dir === 'cr') markedCr++; else markedDr++; } });
+  const unmarkedConvention = (markedCr >= 2 && markedDr === 0) ? 'dr' : ((markedDr >= 2 && markedCr === 0) ? 'cr' : null);
+
+  rows.forEach(r => {
+    if (r.kind === 'open') { r.a = null; r.dir = null; r.b = r.bal ? r.bal.value * ((r.bal.dir === 'dr' || r.bal.sign < 0) ? -1 : 1) : null; return; }
+    let a = null, dir = null;
+    if (roles.debit !== undefined || roles.credit !== undefined) {
+      const dv = r.deb && r.deb.money.value > 0 ? r.deb.money.value : 0, cv = r.cre && r.cre.money.value > 0 ? r.cre.money.value : 0;
+      if (dv && cv) { a = dv; dir = 'dr'; r.warns.push('Both Debit and Credit have an amount - check this row.'); }
+      else if (dv) { a = dv; dir = 'dr'; } else if (cv) { a = cv; dir = 'cr'; }
+      else { a = 0; dir = 'dr'; }
+    } else if (roles.amount !== undefined && r.amt) {
+      const mo = r.amt.money; a = mo.value;
+      if (mo.dir) dir = mo.dir;
+      else if (r.typeText) { const t = r.typeText.trim().toLowerCase(); dir = t[0] === 'd' ? 'dr' : (t[0] === 'c' ? 'cr' : null); }
+      else if (hasNeg) dir = mo.sign < 0 ? 'dr' : 'cr';
+      else if (mo.sign > 0) dir = 'cr';
+    }
+    r.a = a; r.dir = dir;
+    if (r.bal) { const mb = r.bal.money; r.b = mb.value * ((mb.dir === 'dr' || mb.sign < 0) ? -1 : 1); } else r.b = null;
+  });
+
+  const txRows = rows.filter(r => r.kind === 'tx');
+  const entries = rows.map(r => ({ a: r.a, dir: r.dir, b: r.b }));
+  const ba = bestArith(entries);
+  // order: arithmetic first, dates as tie-break
+  const dts = txRows.map(r => r.ymd ? r.ymd.y * 10000 + r.ymd.m * 100 + r.ymd.d : null).filter(v => v != null);
+  const dateOrder = dts.length > 1 ? (dts[0] < dts[dts.length - 1] ? 'asc' : (dts[0] > dts[dts.length - 1] ? 'desc' : null)) : null;
+  let order = 'asc';
+  if (ba.asc.ok !== ba.desc.ok) { order = ba.desc.ok > ba.asc.ok ? 'desc' : 'asc'; if (Math.abs(ba.desc.ok - ba.asc.ok) < 3 && dateOrder) order = dateOrder; }
+  else if (dateOrder) order = dateOrder;
+
+  // an opening balance printed in the statement header acts as the row before the first transaction
+  if (opts._headerOpening != null) {
+    const idx = order === 'asc' ? 0 : rows.length - 1;
+    const f = rows[idx];
+    if (f && f.kind === 'tx' && f.b != null && f.a != null) {
+      const delta = f.b - opts._headerOpening;
+      const consistent = f.dir ? Math.abs(delta - (f.dir === 'cr' ? f.a : -f.a)) <= TOL : Math.abs(Math.abs(delta) - f.a) <= TOL;
+      if (consistent) { const v = { kind: 'open', virtual: true, b: opts._headerOpening, a: null, dir: null, warns: [] }; if (order === 'asc') rows.unshift(v); else rows.push(v); }
+    }
+  }
+
+  // infer unknown directions from balance movement
+  let assumed = 0, guessed = 0;
+  rows.forEach((r, i) => {
+    if (r.kind !== 'tx' || r.dir) return;
+    const nb = order === 'asc' ? rows[i - 1] : rows[i + 1];       // chronologically older neighbour
+    if (nb && nb.b != null && r.b != null) {
+      const delta = r.b - nb.b;
+      if (Math.abs(Math.abs(delta) - r.a) <= TOL) { r.dir = delta > 0 ? 'cr' : 'dr'; return; }
+    }
+    if (unmarkedConvention && roles.amount !== undefined && r.amt && !r.amt.money.dir && !r.typeText && !hasNeg) { r.dir = unmarkedConvention; return; }
+    const crH = CR_HINT.test(r.narration || ''), drH = DR_HINT.test(r.narration || '');
+    if (crH !== drH) { r.dir = crH ? 'cr' : 'dr'; r.guessed = true; guessed++; return; }
+    r.dir = 'dr'; r.assumed = true; assumed++;
+  });
+  if (guessed) warnings.push(`${guessed} row(s): Debit/Credit was not stated and could not be proven from the balance - guessed from the narration. Check them.`);
+  if (assumed) warnings.push(`${assumed} row(s): the statement does not say Debit or Credit and the balance could not settle it - assumed Debit. Check them.`);
+
+  // final arithmetic + row flags
+  const fe = rows.map(r => ({ a: r.a, dir: r.dir, b: r.b }));
+  const fin = arithCheck(fe, order);
+  fin.bad.forEach(i => { if (rows[i] && rows[i].kind === 'tx') rows[i].warns.push('Balance does not follow from the previous row - a row may be missing or misread here.'); });
+  rows.forEach(r => { if (r.kind === 'tx' && !r.ymd) r.warns.push(r.dateSeg ? 'Date could not be read.' : 'No date found for this row.'); });
+  rows.forEach(r => { if (r.kind === 'tx' && r.assumed) r.warns.push('Debit/Credit assumed - check.'); if (r.kind === 'tx' && r.guessed) r.warns.push('Debit/Credit guessed from narration - check.'); });
+  return { order, fin, dateInfo, warnings, assumed, hasNeg };
+}
+
+function toOutput(rows, order) {
+  const out = [];
+  rows.forEach(r => {
+    if (r.kind !== 'tx') return;
+    const fmt = v => (v == null ? '' : (Number.isInteger(v) ? String(v) : v.toFixed(2)));
+    out.push({
+      date: r.ymd ? `${pad2(r.ymd.d)}/${pad2(r.ymd.m)}/${r.ymd.y}` : (r.dateSeg ? r.dateSeg.t : ''),
+      narration: r.narration || '',
+      debit: r.dir === 'dr' && r.a ? fmt(r.a) : '',
+      credit: r.dir === 'cr' && r.a ? fmt(r.a) : '',
+      balance: r.b,
+      warn: r.warns.join(' '),
+      _page: r.page,
+    });
+  });
+  if (order === 'desc') out.reverse();
+  return out;
+}
+
+// ---------------------------------------------------------------- public entry
+function extract(pages, opts) {
+  opts = opts || {};
+  const totalItems = pages.reduce((s, p) => s + p.items.length, 0);
+  if (totalItems < 8) return { ok: false, reason: totalItems ? 'little-text' : 'no-text' };
+  const L = analyzeLayout(pages, opts);
+  if (L.fail) return { ok: false, reason: L.fail };
+  const assign = makeAssigner(L);
+  const { cands } = roleCandidates(L, assign);
+  if (!cands.length) return { ok: false, reason: 'no-roles' };
+
+  const headerOpening = findOpeningBalance(L);
+  let best = null;
+  const tryList = cands.slice(0, 3).filter((c, i) => i === 0 || c.score >= cands[0].score - 0.45);
+  for (const cand of tryList) {
+    const run = runConfig(L, assign, cand, opts);
+    const txCount = run.rows.filter(r => r.kind === 'tx').length;
+    if (!txCount) continue;
+    const fin = finalizeRows(run.rows, cand.roles, { ...opts, _headerOpening: headerOpening });
+    const q = (fin.fin.checked >= 3 ? fin.fin.ok / fin.fin.checked : 0.5) + 0.0001 * txCount + 0.02 * cand.score;
+    if (!best || q > best.q) best = { q, run, fin, cand };
+    if (fin.fin.checked >= 3 && fin.fin.ok === fin.fin.checked) break;
+  }
+  if (!best) return { ok: false, reason: 'no-rows' };
+  const { run, fin, cand } = best;
+  const out = toOutput(run.rows, fin.order);
+  const roleName = k => cand.roles[k] !== undefined ? (L.ncols[cand.roles[k]].label || ('column ' + (cand.roles[k] + 1))) : null;
+  const info = {
+    headerFound: L.hdrSegs.length > 0,
+    columns: {
+      date: L.txDate.label || '(detected by position)', narration: L.narr.label || '(detected by position)',
+      debit: roleName('debit'), credit: roleName('credit'), amount: roleName('amount'), balance: roleName('balance'),
+    },
+    order: fin.order, dateFormat: fin.dateInfo.format, mode: run.blk.mode,
+    reconciled: fin.fin.ok, checked: fin.fin.checked,
+    rowsExtracted: out.length, ignoredLines: run.dropped, ambiguousRuns: run.blk.ambiguousRuns, groupedDates: run.rows.some(r => r.carried),
+    candidateScore: cand.score,
+  };
+  const warnings = [...fin.warnings];
+  if (fin.fin.checked >= 3 && fin.fin.ok / fin.fin.checked < 0.9) warnings.push(`Only ${fin.fin.ok} of ${fin.fin.checked} balances reconcile - some rows may be missing or misread. Check flagged rows against the PDF.`);
+  if (fin.fin.checked < 3) warnings.push('No running balance found to verify the extraction - check the totals against the statement.');
+  return { ok: true, rows: out, info, warnings, _debug: opts.debug ? { L, cands, run, fin } : undefined };
+}
+
+root.StatementEngine = { extract, pagesFromPdf: P1.pagesFromPdf, parseMoney: P1.parseMoney, _parts: { P1, P2 } };
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 let rows = []; // {sno, date, narration, debit, credit, balance, type, typeConfidence, classificationFlags, dynamicFlags}
 
@@ -414,18 +1465,6 @@ dropzone.addEventListener('drop', e => {
   if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
 });
 fileInput.addEventListener('change', e => { if (e.target.files.length) handleFile(e.target.files[0]); });
-
-// Surface a CDN load failure right away, as a clear message rather than a silent
-// dead button. Runs after the listeners above are already attached, so upload
-// for CSV/Excel/TXT keeps working even when this fires for a PDF-only failure.
-(function reportCdnLoadFailures(){
-  const failed = [];
-  if (window.__pdfJsLoadFailed) failed.push('PDF');
-  if (window.__xlsxLoadFailed) failed.push('Excel');
-  if (failed.length) {
-    showAlert(`${failed.join(' and ')} support could not load from the CDN in this environment (often caused by a content blocker, proxy, or a restrictive hosting/preview sandbox). Other upload formats will still work; reloading the page or opening it from a different host may fix this.`);
-  }
-})();
 clearFileBtn.addEventListener('click', () => {
   fileInput.value = '';
   filebar.style.display = 'none';
@@ -932,10 +1971,110 @@ function pdfExtractRow(anchor, rowItems, layout){
   };
 }
 
+// Universal reader: finds the table from the page geometry and verifies every row against the running balance,
+// so it does not depend on header wording, narration alignment, or where dates / amounts sit inside a row.
+// Used first; if it is not confident (balances exist but fewer than 90% reconcile) the original
+// column-detection reader below runs instead, exactly as before.
+async function extractPdfRowsUniversal(pdf, onProgress){
+  if (typeof StatementEngine === 'undefined') return null;
+  const pages = await StatementEngine.pagesFromPdf(pdf, pdfjsLib, (p, n) => {
+    if (onProgress) onProgress(`Reading page ${p} of ${n}…`, 10 + (p / n) * 60);
+  });
+  const res = StatementEngine.extract(pages, {});
+  if (!res.ok || !res.rows.length) return null;
+  const inf = res.info;
+  // reject only when balances exist and disagree with the extraction; with no balance column there is nothing to
+  // verify against (the standard reader cannot verify either)
+  if (inf.checked >= 3 && inf.reconciled / inf.checked < 0.9) return null;
+  // the rest of the tool expects the statement's own display order
+  const list = inf.order === 'desc' ? [...res.rows].reverse() : res.rows;
+  const rawRows = list.map(r => {
+    const unsure = /assumed|guessed/i.test(r.warn || '');
+    const amt = r.debit || r.credit || '';
+    const fix = v => (v === '' || v == null) ? '' : Number(v).toFixed(2);
+    return {
+      date: r.date, narration: r.narration,
+      debit: unsure ? '' : fix(r.debit), credit: unsure ? '' : fix(r.credit),
+      balance: r.balance == null ? '' : Number(r.balance).toFixed(2),
+      amountSource: unsure ? 'COLUMN_AMOUNT' : 'COLUMN_DC',
+      sourceDirection: '', _amount: unsure ? fix(amt) : '', valueDate: '', estimated: false
+    };
+  });
+  const c = inf.columns || {};
+  const cols = ['date', 'narration', 'debit', 'credit', 'amount', 'balance'].filter(k => c[k]);
+  return { rawRows, numPages: pages.length,
+    layoutSummary: `universal geometry reader · ${inf.order === 'desc' ? 'newest first' : 'oldest first'} · columns: ${cols.join(', ')} · ${inf.reconciled}/${inf.checked} balances reconcile` };
+}
+
+// Independent recovery reader: rebuild text lines from PDF coordinates, then run the
+// existing bank-agnostic line parser. This is deliberately separate from column
+// inference so unfamiliar headers/layouts can still recover transactions.
+async function extractPdfRowsByTextRecovery(pdf, onProgress){
+  const recoveredLines = [];
+  let pagesWithText = 0;
+  for (let p = 1; p <= pdf.numPages; p++){
+    if (onProgress) onProgress(`Text recovery — page ${p} of ${pdf.numPages}…`, 12 + (p/pdf.numPages)*65);
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    const vp = page.getViewport({ scale: 1 });
+    const items = content.items.map(it => {
+      const tx = pdfjsLib.Util.transform(vp.transform, it.transform);
+      return { text: String(it.str || ''), x: tx[4], y: tx[5], width: Math.abs(it.width || 0), height: Math.abs(tx[3]) || 8 };
+    }).filter(it => it.text.trim());
+    if (!items.length) continue;
+    pagesWithText++;
+    const lines = pdfYLines(items, Math.max(2.5, median(items.map(it => it.height)) * 0.45));
+    lines.forEach(g => {
+      const sorted = [...g.items].sort((a,b)=>a.x-b.x);
+      let line = '', end = null;
+      sorted.forEach(it => {
+        if (end !== null && it.x - end > Math.max(1.5, it.height * 0.25)) line += ' ';
+        line += it.text;
+        end = it.x + it.width;
+      });
+      if (line.trim()) recoveredLines.push(line.trim());
+    });
+  }
+  // First attempt the normal line parser unchanged.
+  let rawRows = parseLines(recoveredLines);
+
+  // Recovery pass for PDFs where the date and amount are positioned on separate
+  // visual lines (common in statements with wrapped narrations or narrow columns).
+  // Merge each date-starting line with its following continuation lines until the
+  // next date-starting line, then retry. This is only a fallback and does not
+  // replace the original parser's result when it succeeds.
+  if (!rawRows.length) {
+    const dateStart = line => {
+      const t = String(line || '').trim();
+      const m = t.match(DATE_RE);
+      return !!m && (m.index === 0 || /^\s*$/.test(t.slice(0, m.index)));
+    };
+    const mergedBlocks = [];
+    let block = [];
+    for (const line of recoveredLines) {
+      if (dateStart(line)) {
+        if (block.length) mergedBlocks.push(block.join(' '));
+        block = [line];
+      } else if (block.length) {
+        // Ignore obvious page-number-only lines, but preserve other text as it may
+        // be a split narration, reference number, or amount token.
+        if (!/^page\s+\d+$/i.test(String(line).trim())) block.push(line);
+      }
+    }
+    if (block.length) mergedBlocks.push(block.join(' '));
+    rawRows = parseLines(mergedBlocks);
+  }
+  return { rawRows, pagesWithText, lines: recoveredLines.length };
+}
+
+
 async function extractPdfRows(file, onProgress){
-  ensurePdfJsReady();
   const buf = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  try {
+    const universal = await extractPdfRowsUniversal(pdf, onProgress);
+    if (universal) return universal;
+  } catch (e) { console.warn('Universal PDF reader failed, using the standard reader instead:', e); }
   const allRows = [];
   const layoutMethods = [];
   const detectedColumnSets = [];
@@ -989,11 +2128,33 @@ async function extractPdfRows(file, onProgress){
     });
   }
 
+  // If geometry-based extraction is sparse or empty, try an independent text-line
+  // recovery pass. Prefer it only when it recovers more transaction rows, keeping
+  // structured column extraction as the preferred result when both agree.
+  let selectedRows = allRows;
+  let recoverySummary = '';
+  if (allRows.length === 0) {
+    try {
+      const recovered = await extractPdfRowsByTextRecovery(pdf, onProgress);
+      if (recovered.rawRows.length > 0) {
+        selectedRows = recovered.rawRows;
+        recoverySummary = ` · text-line recovery (${recovered.lines} lines)`;
+      } else if (recovered.pagesWithText === 0) {
+        recoverySummary = ' · no selectable text found (likely scanned/image PDF; OCR required)';
+      } else {
+        recoverySummary = ' · text recovery found no transaction rows';
+      }
+    } catch (recoveryError) {
+      console.warn('PDF text recovery pass failed:', recoveryError);
+      recoverySummary = ' · text recovery unavailable';
+    }
+  }
+
   const uniqueMethods = [...new Set(layoutMethods)];
   const cols = [...new Set(detectedColumnSets.flat())];
-  const layoutSummary = `${uniqueMethods.join(' + ') || 'no layout detected'} · columns: ${cols.join(', ') || 'none'}`;
+  const layoutSummary = `${uniqueMethods.join(' + ') || 'no layout detected'} · columns: ${cols.join(', ') || 'none'}${recoverySummary}`;
 
-  return { rawRows: allRows, numPages: pdf.numPages, layoutSummary };
+  return { rawRows: selectedRows, numPages: pdf.numPages, layoutSummary };
 }
 
 // xlsx.full.min.js is already loaded for the Excel export, so it's reused here for
@@ -1334,10 +2495,6 @@ function extractAmounts(text){
   return out;
 }
 
-function normalizeNarrationForDedupe(text){
-  return (text || '').toString().toUpperCase().replace(/\s+/g,' ').trim();
-}
-
 // Plain Levenshtein edit distance, converted to a 0-1 similarity ratio. Stdlib-only
 // (no dependency), same purpose as difflib.SequenceMatcher.ratio() in the Python
 // version of this logic.
@@ -1364,44 +2521,75 @@ function textSimilarity(a, b){
   return maxLen === 0 ? 1 : 1 - levenshtein(a, b) / maxLen;
 }
 
-// Multi-factor duplicate detection: Date + Amount + derived Type + Narration
-// similarity. NEVER removes or merges a row — every match is a flag, keyed by
-// S.No, left for a human to resolve. Narration normalization deliberately stays
-// light (case/whitespace only) — it does NOT strip embedded reference numbers,
-// since those are frequently the one thing distinguishing two real transactions
-// that share a date, amount, and direction (e.g. two UPI payments to the same
-// payee for the same amount on the same day, with different reference IDs).
-const DUP_HIGH = 0.90;  // LIKELY_DUPLICATE
-const DUP_MED  = 0.60;  // POSSIBLE_DUPLICATE — narration only loosely similar
+// Strict duplicate detection: normalized Date + Amount + Narration.
+// Direction is deliberately not part of the key. Matching rows are flagged only;
+// no transaction is ever deleted or merged automatically.
+function normalizeNarrationForDedupe(text){
+  return (text == null ? '' : String(text))
+    .normalize('NFKC')
+    .toUpperCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeDateForDedupe(value){
+  if (value == null || value === '') return null;
+  const raw = String(value).trim();
+  let parsed;
+  const iso = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (iso) parsed = Number(iso[1]) * 10000 + Number(iso[2]) * 100 + Number(iso[3]);
+  else parsed = parseDateValue(raw);
+  if (parsed == null) return null;
+  const year = Math.floor(parsed / 10000);
+  const month = Math.floor((parsed % 10000) / 100);
+  const day = parsed % 100;
+  const check = new Date(Date.UTC(year, month - 1, day));
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() + 1 !== month || check.getUTCDate() !== day) return null;
+  return String(year).padStart(4, '0') + '-' + String(month).padStart(2, '0') + '-' + String(day).padStart(2, '0');
+}
+
+function normalizeAmountForDedupe(row){
+  const hasDebit = row.debit !== '' && row.debit != null;
+  const hasCredit = row.credit !== '' && row.credit != null;
+  // Ambiguous rows must not be grouped using an arbitrary side.
+  if (hasDebit === hasCredit) return null;
+  const raw = String(hasDebit ? row.debit : row.credit).trim();
+  // Accept ordinary grouped amounts and common currency symbols; reject partial parses.
+  const cleaned = raw.replace(/[₹$£€\s,]/g, '');
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(cleaned)) return null;
+  const value = Number(cleaned);
+  if (!Number.isFinite(value)) return null;
+  return String(Math.round(value * 100));
+}
 
 function rowAmount(r){
-  return parseFloat(r.debit) || parseFloat(r.credit) || 0;
+  const amount = normalizeAmountForDedupe(r);
+  return amount == null ? 0 : Number(amount) / 100;
 }
 
 function detectDuplicates(rowsList){
-  // Pass 1 — same date + amount + direction: a real duplicate transaction.
-  // Narration decides whether it's flagged; if narration is materially
-  // different, two entries with the same date/amount/type are left alone —
-  // that's two real transactions, not one re-captured twice.
-  const groups = {};
+  const groups = Object.create(null);
   rowsList.forEach(r => {
-    const key = r.date + '|' + rowAmount(r).toFixed(2) + '|' + (r.type || 'UNRESOLVED');
+    const date = normalizeDateForDedupe(r.date);
+    const amount = normalizeAmountForDedupe(r);
+    const narration = normalizeNarrationForDedupe(r.narration);
+
+    // Missing/invalid key fields are not evidence of a duplicate.
+    if (!date || amount == null || !narration) return;
+
+    const key = JSON.stringify([date, amount, narration]);
     (groups[key] = groups[key] || []).push(r);
   });
+
   Object.values(groups).forEach(group => {
     if (group.length < 2) return;
     for (let a = 0; a < group.length; a++) {
       for (let b = a + 1; b < group.length; b++) {
         const ra = group[a], rb = group[b];
-        const sim = textSimilarity(normalizeNarrationForDedupe(ra.narration), normalizeNarrationForDedupe(rb.narration));
-        if (sim >= DUP_HIGH) {
-          addDynFlag(ra, 'LIKELY_DUPLICATE', 'WARN', `Same date/amount/direction as S.No ${rb.sno}, narration ${Math.round(sim*100)}% similar.`, [rb.sno]);
-          addDynFlag(rb, 'LIKELY_DUPLICATE', 'WARN', `Same date/amount/direction as S.No ${ra.sno}, narration ${Math.round(sim*100)}% similar.`, [ra.sno]);
-        } else if (sim >= DUP_MED) {
-          addDynFlag(ra, 'POSSIBLE_DUPLICATE', 'INFO', `Same date/amount/direction as S.No ${rb.sno}, narration only ${Math.round(sim*100)}% similar — verify.`, [rb.sno]);
-          addDynFlag(rb, 'POSSIBLE_DUPLICATE', 'INFO', `Same date/amount/direction as S.No ${ra.sno}, narration only ${Math.round(sim*100)}% similar — verify.`, [ra.sno]);
-        }
-        // below DUP_MED: narration too different — not flagged, treated as unique
+        addDynFlag(ra, 'LIKELY_DUPLICATE', 'WARN',
+          `Exact normalized date, amount and narration match with S.No ${rb.sno}. Review manually; neither row was removed.`, [rb.sno]);
+        addDynFlag(rb, 'LIKELY_DUPLICATE', 'WARN',
+          `Exact normalized date, amount and narration match with S.No ${ra.sno}. Review manually; neither row was removed.`, [ra.sno]);
       }
     }
   });
@@ -1473,6 +2661,23 @@ function parseDateValue(dateStr){
   return null;
 }
 
+// Statement direction from a list of YYYYMMDD values in document order. Compares every consecutive pair and
+// lets the majority decide, instead of trusting only the first and last dated row: a stray date at either end
+// (a print timestamp in the page footer, a "Period:" line in the header) used to flip the whole statement.
+// A single outlier contributes one "up" and one "down" step, which cancel out. Falls back to first-vs-last on a
+// tie, and to newest-first when no date information exists at all.
+function detectDescending(dateValues){
+  const v = dateValues.filter(x => x !== null && x !== undefined);
+  let down = 0, up = 0;
+  for (let i = 1; i < v.length; i++) {
+    if (v[i] < v[i-1]) down++;
+    else if (v[i] > v[i-1]) up++;
+  }
+  if (down !== up) return down > up;
+  if (v.length >= 2 && v[0] !== v[v.length-1]) return v[0] > v[v.length-1];
+  return true;
+}
+
 function addClassFlag(row, code, severity, message, relatedSno){
   row.classificationFlags.push({ code, severity, message, relatedSno: relatedSno || [] });
 }
@@ -1500,15 +2705,107 @@ function classifyByBalanceDelta(rowsList){
 
   // Work in chronological order for balance comparisons, while preserving the
   // statement's original display order.
-  let descending = true;
-  const dated = rowsList.filter(r => parseDateValue(r.date) !== null);
-  if (dated.length >= 2) {
-    const first = parseDateValue(dated[0].date), last = parseDateValue(dated[dated.length - 1].date);
-    if (first !== last) descending = first > last;
-  }
+  const descending = detectDescending(rowsList.map(r => parseDateValue(r.date)));
   const order = [];
   if (descending) { for (let i = rowsList.length - 1; i >= 0; i--) order.push(i); }
   else { for (let i = 0; i < rowsList.length; i++) order.push(i); }
+
+  // Recover a missing running balance only when BOTH surrounding known
+  // balances prove the arithmetic. Every row in the missing run must have
+  // exactly one explicit debit/credit amount, and the following known-balance
+  // row must also have a usable amount for the anchor check. Never guess across
+  // an unresolved gap or overwrite a balance that was actually extracted.
+  for (let p = 0; p < order.length; p++) {
+    const row = rowsList[order[p]];
+    const currentBalance = (row.balance !== '' && row.balance != null) ? parseFloat(row.balance) : NaN;
+    if (isFinite(currentBalance)) continue;
+
+    const runStart = p;
+    while (p < order.length) {
+      const candidate = rowsList[order[p]];
+      const candidateBalance = (candidate.balance !== '' && candidate.balance != null) ? parseFloat(candidate.balance) : NaN;
+      if (isFinite(candidateBalance)) break;
+      p++;
+    }
+    const runEnd = p - 1;
+    const previousRow = runStart > 0 ? rowsList[order[runStart - 1]] : null;
+    const nextRow = p < order.length ? rowsList[order[p]] : null;
+
+    // A missing run at the OLDEST end of a newest-first statement has no
+    // earlier balance anchor. It can still be reconstructed safely by walking
+    // backwards from the next known chronological balance: the next row's
+    // balance equals this row's balance plus the next row's credit-minus-debit.
+    // This is the boundary case for a final displayed row such as S.No 206.
+    if (!previousRow && nextRow) {
+      let successor = nextRow;
+      let successorBalance = parseFloat(nextRow.balance);
+      const inferredFromBoundary = [];
+      let boundaryValid = isFinite(successorBalance);
+
+      // Validate every missing row has exactly one usable transaction side.
+      for (let q = runStart; q <= runEnd; q++) {
+        const missingRow = rowsList[order[q]];
+        const debit = parseFloat(missingRow.debit) || 0;
+        const credit = parseFloat(missingRow.credit) || 0;
+        if ((debit > 0) === (credit > 0)) { boundaryValid = false; break; }
+      }
+
+      // Walk from the known row back through the missing run. To recover a
+      // row's closing balance, subtract the NEXT chronological row's delta.
+      for (let q = runEnd; boundaryValid && q >= runStart; q--) {
+        const successorDebit = parseFloat(successor.debit) || 0;
+        const successorCredit = parseFloat(successor.credit) || 0;
+        if ((successorDebit > 0) === (successorCredit > 0)) { boundaryValid = false; break; }
+        const inferredBalance = successorBalance - (successorCredit - successorDebit);
+        const missingRow = rowsList[order[q]];
+        inferredFromBoundary.push({ row: missingRow, balance: inferredBalance });
+        successor = missingRow;
+        successorBalance = inferredBalance;
+      }
+
+      if (boundaryValid) {
+        inferredFromBoundary.forEach(item => {
+          item.row.balance = item.balance.toFixed(2);
+          addClassFlag(item.row, 'BALANCE_INFERRED', 'INFO',
+            `Running balance reconstructed as ₹${item.row.balance} by working backwards from the next verified balance.`);
+        });
+      }
+      continue;
+    }
+
+    // A missing run at the newest end cannot be reconstructed from a later
+    // balance because no subsequent transaction exists to provide an anchor.
+    if (!previousRow || !nextRow) continue;
+
+    const previousBalance = parseFloat(previousRow.balance);
+    const nextBalance = parseFloat(nextRow.balance);
+    if (!isFinite(previousBalance) || !isFinite(nextBalance)) continue;
+
+    let running = previousBalance;
+    const inferred = [];
+    let validRun = true;
+    for (let q = runStart; q <= runEnd; q++) {
+      const missingRow = rowsList[order[q]];
+      const debit = parseFloat(missingRow.debit) || 0;
+      const credit = parseFloat(missingRow.credit) || 0;
+      const hasDebit = debit > 0, hasCredit = credit > 0;
+      if (hasDebit === hasCredit) { validRun = false; break; }
+      running += credit - debit;
+      inferred.push({ row: missingRow, balance: running });
+    }
+
+    const nextDebit = parseFloat(nextRow.debit) || 0;
+    const nextCredit = parseFloat(nextRow.credit) || 0;
+    if ((nextDebit > 0) === (nextCredit > 0)) validRun = false;
+    const expectedNextBalance = running + nextCredit - nextDebit;
+    if (!validRun || Math.abs(expectedNextBalance - nextBalance) > BALANCE_TOLERANCE) continue;
+
+    inferred.forEach(item => {
+      item.row.balance = item.balance.toFixed(2);
+      addClassFlag(item.row, 'BALANCE_INFERRED', 'INFO',
+        `Running balance reconstructed as ₹${item.row.balance} from the surrounding verified balance chain.`);
+    });
+  }
 
   let lastKnownBalance = null, lastKnownSno = null, chainBroken = false;
 
@@ -1779,12 +3076,7 @@ function parseLines(lines){
   // variable) silently inverted the comparison for every row, and also meant the very
   // first row on every page had no usable prior balance at all and always fell back to
   // a hard-coded "Debit" default — regardless of whether it actually was one.
-  const dated = blocks.filter(b => b.dateValue !== null);
-  let descending = true; // default: newest-first, the more common layout
-  if (dated.length >= 2) {
-    const first = dated[0].dateValue, last = dated[dated.length - 1].dateValue;
-    if (first !== last) descending = first > last;
-  }
+  const descending = detectDescending(blocks.map(b => b.dateValue)); // newest-first by default; majority vote over all rows
 
   // ---------- PASS 2: resolve debit / credit using the correct chronological neighbour ----------
   const out = blocks.map((b, i) => {
@@ -1991,7 +3283,7 @@ function updateSummary(){
 
 // ---------- Processing Summary / Anomaly Report ----------
 const CODE_LABELS = {
-  OPENING_ROW: 'Opening/anchor row', MISSING_BALANCE: 'Balance missing',
+  OPENING_ROW: 'Opening/anchor row', MISSING_BALANCE: 'Balance missing', BALANCE_INFERRED: 'Balance reconstructed from verified chain',
   NO_COLUMN_AMOUNT: 'Detected amount column empty', AMBIGUOUS_AMOUNT_DIRECTION: 'Amount direction ambiguous',
   CHAIN_RESUMED: 'Balance chain resumed', ZERO_DELTA: 'Balance unchanged',
   BALANCE_AMOUNT_MISMATCH: 'Stated amount vs. balance delta mismatch',
